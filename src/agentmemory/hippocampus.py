@@ -85,15 +85,55 @@ def get_db() -> sqlite3.Connection:
 
 
 def parse_ts(value: str) -> datetime:
+    """Parse a stored timestamp string, always returning an aware UTC datetime.
+
+    THE-65 timestamp policy: legacy naive stored values (written by old code
+    via bare `datetime.now().strftime(...)`) are treated as UTC directly --
+    not converted from local time. This is a deliberate policy decision, not
+    an oversight: the writer inventory (THE-65) confirmed every real
+    days_since() comparison in this codebase is day-scale (14/30-day cutoffs,
+    day-rate decay), so the choice between "legacy naive = local" and
+    "legacy naive = UTC" almost never changes behavior in practice -- but it
+    must be deterministic and environment-independent (not dependent on
+    whichever machine happens to run the code), which ruled out local-time
+    interpretation.
+    """
     if value is None:
         return None
     normalized = value.strip().replace("Z", "+00:00")
     if " " in normalized and "T" not in normalized:
         normalized = normalized.replace(" ", "T", 1)
-    return datetime.fromisoformat(normalized)
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        # Naive: no source timezone to convert *from* -- the policy above is
+        # to declare these UTC directly, not convert them.
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        # Already aware with some other offset (e.g. "+05:00") -- actually
+        # convert to UTC, don't just leave it in its original offset. Caught
+        # by test_parse_ts_normalizes_positive_offset_to_utc /
+        # _negative_offset_to_utc: an earlier version of this function only
+        # handled the naive case and left explicit-offset inputs unconverted,
+        # which would have made day-scale comparisons against them wrong by
+        # the size of that offset.
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
 def days_since(now: datetime, timestamp: str) -> float:
+    """Days elapsed between `now` and a stored `timestamp` string.
+
+    `timestamp` is parsed via parse_ts(), which always returns aware UTC
+    (see its docstring for the legacy-naive policy). `now`, by contrast, is
+    always a live "current moment" value computed by the caller -- never a
+    legacy stored string -- so unlike parse_ts's naive-stored-value policy,
+    a naive `now` genuinely represents local wall-clock time (from a bare
+    `datetime.now()` call) and must be *converted* to UTC, not relabeled.
+    Callers that already pass an aware `now` (UTC or otherwise) are used
+    as-is.
+    """
+    if now.tzinfo is None:
+        now = now.astimezone(timezone.utc)
     dt = parse_ts(timestamp)
     if dt is None:
         return 0.0
@@ -1151,8 +1191,16 @@ def schedule_spaced_reviews(db: sqlite3.Connection, min_confidence: float = 0.3)
 
 
 def process_due_reviews(db: sqlite3.Connection) -> Dict[str, int]:
-    """Process memories whose next_review_at has passed. Replay + reschedule."""
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    """Process memories whose next_review_at has passed. Replay + reschedule.
+
+    next_review_at is written via SQLite's own UTC `strftime(..., 'now', ...)`
+    (see schedule_spaced_reviews above and the reschedule at the end of this
+    function) -- the due-check below must compare against UTC "now" too, not
+    Python's local datetime.now(), or a review due in real UTC terms could
+    read as "not due yet" on a UTC-behind machine (same bug class as
+    labile_until, THE-65 cluster 2).
+    """
+    now = datetime.now().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     rows = db.execute("""
         SELECT id, temporal_class, stability FROM memories
         WHERE retired_at IS NULL AND next_review_at IS NOT NULL
@@ -3428,13 +3476,20 @@ def assign_epoch(conn: sqlite3.Connection, ts: Optional[str] = None) -> Optional
     Returns the epoch id.
     """
     if ts is None:
-        ts = datetime.now().isoformat()
+        # epochs.started_at/ended_at are compared elsewhere in the codebase
+        # (_impl.py, mcp_tools_temporal.py) against SQLite's own UTC
+        # strftime('now') -- defaulting to local datetime.now() here produced
+        # a value inconsistent with those comparisons on a UTC-behind
+        # machine (same bug class as labile_until/next_review_at, THE-65).
+        ts = datetime.now().astimezone(timezone.utc).isoformat()
 
     # Normalize timestamp
     normalized = ts.strip().replace("Z", "+00:00")
     if " " in normalized and "T" not in normalized:
         normalized = normalized.replace(" ", "T", 1)
-    # Strip timezone info for comparison with SQLite datetimes
+    # Strip timezone info for comparison with SQLite datetimes -- callers
+    # passing an explicit `ts` are expected to pass it already UTC-anchored
+    # (matching how started_at/ended_at are written/queried elsewhere).
     dt = datetime.fromisoformat(normalized)
     ts_sql = dt.strftime("%Y-%m-%dT%H:%M:%S")
 
