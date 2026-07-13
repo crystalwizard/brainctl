@@ -346,7 +346,15 @@ def _unpack_vector_safe(blob: bytes, dimensions: int = 768) -> Optional[List[flo
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
+    """Cosine similarity. Vectors of unequal length are rejected (returns
+    0.0, "not similar") rather than silently compared over their shorter
+    common prefix -- `zip()` truncates instead of raising, which previously
+    let two embeddings from different models/dimensions produce a
+    mathematically meaningless partial-dot-product score instead of being
+    treated as incomparable (GPT's independent audit, finding #9)."""
     if not a or not b:
+        return 0.0
+    if len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     na = sum(x * x for x in a) ** 0.5
@@ -403,6 +411,12 @@ def run_rem_phase(
     ).fetchall()
 
     if isolated_rows:
+        # ORDER BY m.id: previously unordered with LIMIT 500, so which 500
+        # connected candidates participated in bridge discovery was
+        # non-deterministic (SQLite makes no ordering guarantee without an
+        # explicit ORDER BY) -- two runs against the same unmodified database
+        # could pick different candidate sets and produce different bridges.
+        # GPT's independent audit, finding #9.
         connected_rows = db.execute(
             """
             SELECT DISTINCT m.id, m.content, m.scope, e.vector, e.dimensions
@@ -413,6 +427,7 @@ def run_rem_phase(
             JOIN embeddings e
               ON e.source_table='memories' AND e.source_id=m.id
             WHERE m.retired_at IS NULL
+            ORDER BY m.id ASC
             LIMIT 500
             """
         ).fetchall()
