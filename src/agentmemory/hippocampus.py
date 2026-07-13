@@ -89,14 +89,23 @@ def parse_ts(value: str) -> datetime:
 
     THE-65 timestamp policy: legacy naive stored values (written by old code
     via bare `datetime.now().strftime(...)`) are treated as UTC directly --
-    not converted from local time. This is a deliberate policy decision, not
-    an oversight: the writer inventory (THE-65) confirmed every real
-    days_since() comparison in this codebase is day-scale (14/30-day cutoffs,
-    day-rate decay), so the choice between "legacy naive = local" and
-    "legacy naive = UTC" almost never changes behavior in practice -- but it
-    must be deterministic and environment-independent (not dependent on
-    whichever machine happens to run the code), which ruled out local-time
-    interpretation.
+    not converted from local time. Deliberate, not an oversight: it must be
+    deterministic and environment-independent (not dependent on whichever
+    machine happens to run the code), which ruled out local-time
+    interpretation regardless of how much it matters in practice.
+
+    How much it matters, honestly (GPT's review, THE-65, caught an earlier
+    version of this docstring overstating this): the writer inventory found
+    MOST real days_since() comparisons in this codebase are day-scale
+    (14/30-day cutoffs, day-rate decay), where the naive/UTC choice rarely
+    changes behavior -- but NOT all. Two real exceptions are on record, not
+    erased: temporal_classification_pass's `age_days < 1.0` -> "ephemeral"
+    rule is a same-day boundary where the choice can matter, and
+    search_memories's continuous recency_boost = exp(-0.03*elapsed) is a
+    continuous function, not a threshold, where a systematic offset can
+    (rarely) flip a near-tied ranking. Neither exception changes the policy
+    decision above (determinism still wins), but neither should be
+    hand-waved as "day-scale, so it doesn't matter."
     """
     if value is None:
         return None
