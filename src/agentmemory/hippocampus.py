@@ -962,6 +962,13 @@ def apply_decay(conn: sqlite3.Connection, now: Optional[datetime] = None) -> Dic
     if now is None:
         now = datetime.now()
     now_sql = now.strftime("%Y-%m-%dT%H:%M:%S")
+    # UTC-anchored "now" for comparing against labile_until specifically (see
+    # comment at the comparison site below). Derived from the same `now` via
+    # .astimezone(), not a fresh datetime.now(timezone.utc) call, so passing an
+    # explicit `now=` for testing still produces a deterministic, correct
+    # conversion (a naive datetime's .astimezone() assumes system local time,
+    # which is exactly what this function's naive `now` values represent).
+    _now_utc_sql = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     _protected_col = has_column(conn, "memories", "protected")
     _protected_select = ", protected" if _protected_col else ""
@@ -992,10 +999,16 @@ def apply_decay(conn: sqlite3.Connection, now: Optional[datetime] = None) -> Dic
             stats["skipped_permanent"] += 1
             continue
 
-        # Behavioral tagging: memories in their labile window are immune to decay
+        # Behavioral tagging: memories in their labile window are immune to decay.
+        # labile_until is written elsewhere (_impl.py, mcp_tools_meb.py) using
+        # SQLite's UTC 'now', not Python's local datetime.now() -- comparing it
+        # against the function's local `now_sql` (used for created_at/
+        # last_recalled_at day-scale math below, which is UTC-vs-local-safe per
+        # the writer inventory) silently over-extended the labile window by the
+        # local UTC offset. Uses its own UTC-anchored comparison value instead.
         if _has_labile:
             labile_until = row["labile_until"]
-            if labile_until and labile_until > now_sql:
+            if labile_until and labile_until > _now_utc_sql:
                 stats["skipped_labile"] += 1
                 continue
 
