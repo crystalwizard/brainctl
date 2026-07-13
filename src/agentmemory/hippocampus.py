@@ -438,6 +438,26 @@ def has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(r["name"] == column for r in rows)
 
 
+def _add_column_if_missing(db: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """ALTER TABLE ADD COLUMN, tolerant of a concurrent-writer race.
+
+    has_column() + ALTER TABLE is a check-then-act with no lock. Two
+    processes (e.g. scheduler.py's cron path and the dream-daemon, per
+    THE-65's two-orchestrator finding) can both observe the column missing
+    before either commits, so the loser's ALTER TABLE hits a real
+    "duplicate column name" error. Swallow only that specific error --
+    same tolerance migrate.py's _apply_sql already uses for the identical
+    error class -- and re-raise anything else.
+    """
+    if has_column(db, table, column):
+        return
+    try:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 # ---------------------------------------------------------------------------
 # Inline embedding helper
 # Embeds a newly-written memory row immediately so consolidation and episodic
@@ -1717,14 +1737,9 @@ def run_hebbian_pass(
     }
 
     # Schema migrations: add columns to knowledge_edges if missing (always run — safe DDL)
-    if not has_column(db, "knowledge_edges", "last_reinforced_at"):
-        db.execute("ALTER TABLE knowledge_edges ADD COLUMN last_reinforced_at TEXT")
-    if not has_column(db, "knowledge_edges", "co_activation_count"):
-        db.execute(
-            "ALTER TABLE knowledge_edges ADD COLUMN co_activation_count INTEGER DEFAULT 0"
-        )
-    if not has_column(db, "knowledge_edges", "weight_updated_at"):
-        db.execute("ALTER TABLE knowledge_edges ADD COLUMN weight_updated_at TEXT")
+    _add_column_if_missing(db, "knowledge_edges", "last_reinforced_at", "TEXT")
+    _add_column_if_missing(db, "knowledge_edges", "co_activation_count", "INTEGER DEFAULT 0")
+    _add_column_if_missing(db, "knowledge_edges", "weight_updated_at", "TEXT")
 
     # 1. Co-retrieval session detection via last_recalled_at
     # Collect memories recalled in the last 30 days, sorted by recall time
