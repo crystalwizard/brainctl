@@ -262,42 +262,74 @@ def think_from_query(
 # NREM phase — replay + edge strengthening + dead-edge pruning
 # ============================================================================
 
+NREM_PRUNE_RELATION_TYPES = ("co_referenced",)
+NREM_PRUNE_STALE_DAYS = 30
+
+
 def run_nrem_phase(
     db: sqlite3.Connection,
     agent_id: str = "hippocampus",
     prune_weight_threshold: float = 0.05,
+    now=None,
 ) -> Dict[str, Any]:
     """NREM: replay recent high-recall memories, strengthen co-active edges,
     weaken stale ones, prune dead ones.
 
-    Wraps existing experience_replay + run_hebbian_pass, then prunes any
-    knowledge_edge whose weight has decayed below `prune_weight_threshold`
-    (these are functionally dead and just bloat the graph).
+    Wraps existing experience_replay + run_hebbian_pass, then prunes
+    knowledge_edges that are BOTH (a) an NREM-owned relation type
+    (co_referenced -- the type run_hebbian_pass itself creates/strengthens/
+    decays) AND (b) weight has decayed below `prune_weight_threshold` AND
+    (c) not reinforced in NREM_PRUNE_STALE_DAYS days.
+
+    THE-65 finding (GPT's independent audit, 2026-07-12): the prior version
+    of this query was `DELETE FROM knowledge_edges WHERE weight < ?` with no
+    relation_type filter and no staleness check at all -- it could delete
+    hand-authored, imported, causal, or semantic edges (any relation_type)
+    merely because their weight happened to be below 0.05, which is
+    destructive and outside NREM's actual job of cleaning up dead
+    co-retrieval associations specifically.
     """
-    from agentmemory.hippocampus import experience_replay, run_hebbian_pass
+    from agentmemory.hippocampus import days_since, experience_replay, run_hebbian_pass
+
+    if now is None:
+        now = datetime.now()
 
     stats: Dict[str, Any] = {"phase": "nrem"}
 
     replay_stats = experience_replay(db, top_k=10)
     stats["replay"] = replay_stats
 
-    hebbian_stats = run_hebbian_pass(db)
+    hebbian_stats = run_hebbian_pass(db, now=now)
     stats["hebbian"] = hebbian_stats
 
-    # Prune dead edges (weight < threshold AND no recent reinforcement)
-    pruned_row = db.execute(
-        "SELECT count(*) AS cnt FROM knowledge_edges WHERE weight < ?",
-        (prune_weight_threshold,),
-    ).fetchone()
-    pruned_count = int(pruned_row["cnt"] if pruned_row else 0)
+    # Prune dead, stale, NREM-owned edges only.
+    relation_placeholders = ",".join("?" for _ in NREM_PRUNE_RELATION_TYPES)
+    candidate_rows = db.execute(
+        f"""
+        SELECT id, COALESCE(last_reinforced_at, created_at) AS last_activity
+        FROM knowledge_edges
+        WHERE weight < ? AND relation_type IN ({relation_placeholders})
+        """,
+        (prune_weight_threshold, *NREM_PRUNE_RELATION_TYPES),
+    ).fetchall()
+
+    stale_ids = [
+        row["id"] for row in candidate_rows
+        if days_since(now, row["last_activity"]) >= NREM_PRUNE_STALE_DAYS
+    ]
+
+    pruned_count = len(stale_ids)
     if pruned_count > 0:
+        id_placeholders = ",".join("?" for _ in stale_ids)
         db.execute(
-            "DELETE FROM knowledge_edges WHERE weight < ?",
-            (prune_weight_threshold,),
+            f"DELETE FROM knowledge_edges WHERE id IN ({id_placeholders})",
+            stale_ids,
         )
         db.commit()
     stats["pruned_dead_edges"] = pruned_count
     stats["prune_threshold"] = prune_weight_threshold
+    stats["prune_relation_types"] = list(NREM_PRUNE_RELATION_TYPES)
+    stats["prune_stale_days"] = NREM_PRUNE_STALE_DAYS
 
     return stats
 
