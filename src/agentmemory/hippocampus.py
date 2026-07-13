@@ -2264,6 +2264,12 @@ def cmd_consolidation_cycle(args):
         return
     now = datetime.now()
     now_sql = now.strftime("%Y-%m-%dT%H:%M:%S")
+    # Non-phased path has no --dry-run flag registered on this subcommand today
+    # (see build_parser's `cycle` subparser) -- always real execution. Defined
+    # explicitly rather than left undefined so Pass 7b below doesn't reference a
+    # missing name (was NameError, silently swallowed into a success-shaped
+    # procedural_synthesis result -- see tests/test_consolidation_cycle_safety.py).
+    dry_run = getattr(args, 'dry_run', False)
 
     # Pass 0 (EWC): compute importance scores before any destructive pass
     ewc_stats = compute_ewc_importance(db, now=now)
