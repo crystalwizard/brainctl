@@ -3496,16 +3496,18 @@ def assign_epoch(conn: sqlite3.Connection, ts: Optional[str] = None) -> Optional
         # strftime('now') -- defaulting to local datetime.now() here produced
         # a value inconsistent with those comparisons on a UTC-behind
         # machine (same bug class as labile_until/next_review_at, THE-65).
-        ts = datetime.now().astimezone(timezone.utc).isoformat()
-
-    # Normalize timestamp
-    normalized = ts.strip().replace("Z", "+00:00")
-    if " " in normalized and "T" not in normalized:
-        normalized = normalized.replace(" ", "T", 1)
-    # Strip timezone info for comparison with SQLite datetimes -- callers
-    # passing an explicit `ts` are expected to pass it already UTC-anchored
-    # (matching how started_at/ended_at are written/queried elsewhere).
-    dt = datetime.fromisoformat(normalized)
+        dt = datetime.now().astimezone(timezone.utc)
+    else:
+        # GPT's review of cluster 3 (THE-65): this branch used to have its
+        # own inline normalize-then-strftime logic that parsed an explicit
+        # `ts` (correctly handling naive/Z/offset input) but then formatted
+        # it via bare strftime() without ever calling astimezone(utc) first --
+        # for an offset-bearing input (e.g. "...-07:00"), that silently
+        # stripped the offset instead of converting, the exact "strips
+        # without converting" bug GPT flagged. Reusing parse_ts() directly
+        # instead of duplicating (and re-breaking) the same normalization
+        # logic a second time in this function.
+        dt = parse_ts(ts)
     ts_sql = dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     # Find matching epoch (started_at <= ts AND (ended_at IS NULL OR ended_at >= ts))

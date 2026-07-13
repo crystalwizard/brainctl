@@ -86,3 +86,51 @@ def test_assign_epoch_default_timestamp_matches_utc_written_epoch_bounds(brain):
         "assign_epoch(ts=None) failed to match the UTC-anchored epoch that "
         "genuinely covers the current instant -- UTC/local comparison mismatch"
     )
+
+
+def test_assign_epoch_explicit_offset_timestamp_is_converted_not_stripped(brain):
+    """GPT's review of cluster 3 (THE-65): assign_epoch's explicit-ts branch
+    used to parse an offset-bearing timestamp correctly but then format it
+    via bare strftime() without ever converting to UTC first -- silently
+    stripping the offset instead of converting it. A caller passing
+    "...+05:00" would get the wrong wall-clock digits compared against
+    UTC-anchored epoch bounds.
+
+    This constructs an epoch whose UTC-anchored bounds do NOT cover the
+    *local* digits of a +05:00-offset timestamp, but DO cover its correct
+    UTC equivalent -- so this only passes if the offset is actually
+    converted, not merely stripped.
+    """
+    db = brain._get_conn()
+    now_utc = datetime.now().astimezone(timezone.utc)
+
+    # An epoch that covers [now_utc - 1h, now_utc + 1h] in real UTC terms.
+    started_at = (now_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    ended_at = (now_utc + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    db.execute(
+        "INSERT INTO epochs (name, description, started_at, ended_at) "
+        "VALUES ('UTC-bounded epoch', 'covers now in UTC', ?, ?)",
+        (started_at, ended_at),
+    )
+    db.commit()
+
+    # Express "now" at +05:00 -- its local digits read 5 hours ahead of UTC,
+    # which (if merely stripped, not converted) would place it outside the
+    # epoch's UTC-anchored bounds whenever now_utc is within 5 hours of
+    # either boundary. Using +05:00 specifically (not this machine's own
+    # -07:00) keeps the test's correctness independent of which machine
+    # runs it.
+    plus_five_ts = now_utc.astimezone(timezone(timedelta(hours=5))).strftime(
+        "%Y-%m-%dT%H:%M:%S+05:00"
+    )
+
+    epoch_id = assign_epoch(db, ts=plus_five_ts)
+
+    row = db.execute(
+        "SELECT id FROM epochs WHERE name = 'UTC-bounded epoch'"
+    ).fetchone()
+    assert epoch_id == row["id"], (
+        "assign_epoch() with an explicit +05:00-offset timestamp failed to "
+        "match the UTC-anchored epoch that genuinely covers that instant -- "
+        "offset was stripped instead of converted to UTC"
+    )
