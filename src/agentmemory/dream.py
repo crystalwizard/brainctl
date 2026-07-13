@@ -620,20 +620,33 @@ def run_insight_phase(
         # Avoid writing duplicate insights for the same bridge node
         existing = db.execute(
             "SELECT id FROM memories WHERE retired_at IS NULL "
-            "AND content LIKE ? AND category='lesson'",
+            "AND content LIKE ? AND category='hypothesis'",
             (f"Bridge insight: memory#{mem_id} %",),
         ).fetchone()
         if existing:
             stats["skipped_existing"] += 1
             continue
 
+        # THE-65, GPT's independent audit finding #4: this used to write
+        # category='lesson', memory_type='semantic', temporal_class='long' --
+        # i.e. straight into the schema's "accepted, reviewed knowledge"
+        # shape. Graph betweenness only proves a memory topologically
+        # bridges two communities; it does not prove the generated prose is
+        # a valid lesson. Writing as category='hypothesis' (the same
+        # unreviewed-candidate category REM's own bisociation output uses,
+        # and which experience_replay now explicitly excludes from
+        # self-validating replay) keeps this an honestly-unreviewed
+        # candidate instead of an accepted fact, without inventing new
+        # schema -- a full candidate/accepted/rejected lifecycle with
+        # structured provenance is a separate, larger decision GPT flagged
+        # as still open, not implemented here.
         _ensure_agent(db, agent_id)
         db.execute(
             """
             INSERT INTO memories
               (agent_id, category, scope, content, confidence, temporal_class, memory_type,
                tags, created_at, updated_at)
-            VALUES (?, 'lesson', 'global', ?, ?, 'long', 'semantic',
+            VALUES (?, 'hypothesis', 'global', ?, ?, 'ephemeral', 'episodic',
                     '["dream","insight","community_bridge"]', ?, ?)
             """,
             (agent_id, insight_content, round(min(0.5 + bscore * 10, 0.9), 3), now, now),
