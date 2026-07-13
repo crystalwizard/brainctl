@@ -1968,7 +1968,23 @@ def experience_replay(
     replayed memory we apply a small recall boost (reconsolidation) and log a
     replay event so the access is visible to the brainctl search pipeline.
 
-    Returns stats dict: {replayed, ids, skipped_permanent}.
+    Excludes category='hypothesis' memories (THE-65, GPT's independent audit
+    finding #2): dream-generated hypotheses were previously eligible for
+    ordinary replay, which increments recalled_count -- and run_dream_pass's
+    promotion check treats ANY recalled_count > 0 as evidence the hypothesis
+    was meaningfully recalled and endorsed. Without this exclusion, a
+    hypothesis could be "recalled" purely by automatic maintenance replay
+    and then promote itself to an accepted lesson on a later REM pass, with
+    no user or agent ever actually retrieving or endorsing it -- a
+    self-fulfilling consolidation loop.
+
+    Returns stats dict: {replayed, ids, permanent_boosted}. `permanent_boosted`
+    (previously misleadingly named `skipped_permanent`) counts permanent
+    memories that were included in this replay batch -- they ARE boosted,
+    same as any other memory (apply_recall_boost's own docstring: "Permanent
+    memories are boosted too, they just never decay"), just tracked
+    separately since demand for that count already existed. The old name
+    claimed a skip that never happened (GPT's independent audit finding #17).
     """
     if now is None:
         now = datetime.now()
@@ -1977,7 +1993,7 @@ def experience_replay(
         """
         SELECT id, recalled_count, confidence, temporal_class
         FROM memories
-        WHERE retired_at IS NULL
+        WHERE retired_at IS NULL AND category != 'hypothesis'
         ORDER BY recalled_count DESC, confidence DESC
         LIMIT ?
         """,
@@ -1985,18 +2001,17 @@ def experience_replay(
     ).fetchall()
 
     replayed_ids = []
-    skipped = 0
+    permanent_boosted = 0
     for row in rows:
         mem_id = row["id"]
         if row["temporal_class"] == "permanent":
-            skipped += 1
-            # permanent memories don't need boost; still count as replayed
+            permanent_boosted += 1
         result = apply_recall_boost(conn, mem_id, now=now)
         if result:
             replayed_ids.append(mem_id)
 
     conn.commit()
-    return {"replayed": len(replayed_ids), "ids": replayed_ids, "skipped_permanent": skipped}
+    return {"replayed": len(replayed_ids), "ids": replayed_ids, "permanent_boosted": permanent_boosted}
 
 
 def build_entity_clusters(db, min_cluster_size=2):
