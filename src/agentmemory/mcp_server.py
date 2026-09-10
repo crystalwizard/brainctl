@@ -383,7 +383,13 @@ def _ensure_fts_index_consistent(conn) -> bool:
     """
     # R2-F1: capture this BEFORE any write, so a caller's own already-open
     # transaction is never finalized by this function's commits below.
-    had_txn = conn.in_transaction
+    # getattr fallback: some existing tests pass a duck-typed proxy around
+    # a real connection (only execute()/commit()) rather than a genuine
+    # sqlite3.Connection -- caught as a real regression when this shipped
+    # without it. Defaulting to False there just preserves the pre-fix
+    # unconditional-commit behavior for that narrow case, not a real gap
+    # for actual connections, which always have the attribute.
+    had_txn = getattr(conn, "in_transaction", False)
 
     try:
         conn.execute("SELECT count(*) FROM memories LIMIT 1")
@@ -543,7 +549,7 @@ def _ensure_fts_triggers_scoped(conn) -> bool:
         return False
     # R2-F1: capture before any write so a caller's own already-open
     # transaction is never finalized by this function's commit.
-    had_txn = conn.in_transaction
+    had_txn = getattr(conn, "in_transaction", False)
     # Python's sqlite3.executescript() implicitly COMMITs any pending
     # transaction before running -- that would silently end the SAVEPOINT
     # below before it could protect anything (confirmed the hard way while
