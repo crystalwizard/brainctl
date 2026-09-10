@@ -72,6 +72,51 @@ def _restore_module_helpers():
             pass
 
 
+# --- THE-65 production-path lock, actually wired (R2-B2 fix) -------------
+# _impl.py, hippocampus.py, and mcp_server.py each carry a module-level
+# _DB_PATH_LOCKED flag, documented as "set True by a test that has patched
+# DB_PATH, reset by tests/conftest.py's autouse fixture" -- but no such
+# fixture ever existed. Ari's independent review confirmed the mechanism was
+# entirely inert: nothing outside those three modules ever set the flag.
+# This is the actual fixture that claim was describing.
+_DB_PATH_LOCK_MODULES = ("agentmemory._impl", "agentmemory.hippocampus", "agentmemory.mcp_server")
+
+
+@pytest.fixture(autouse=True)
+def _reset_db_path_lock():
+    """Defensive baseline, both before and after every test: whatever the
+    flag's state, force it back to False so one test can never leave it
+    leaked True (silently disabling another test's intended env-var
+    isolation) or leaked False (silently exposing another test's patched
+    DB_PATH to ambient env-var clobbering)."""
+    def _set_all(value):
+        for mod_name in _DB_PATH_LOCK_MODULES:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            if hasattr(mod, "_DB_PATH_LOCKED"):
+                mod._DB_PATH_LOCKED = value
+
+    _set_all(False)
+    yield
+    _set_all(False)
+
+
+@pytest.fixture
+def locked_db_path(monkeypatch, tmp_path):
+    """The actual safe way to patch DB_PATH in-process: sets DB_PATH on all
+    three modules AND locks it, so ambient BRAIN_DB/BRAINCTL_DB/BRAINCTL_HOME
+    cannot clobber it before this test's assertions run. Automatically
+    unlocked afterward by _reset_db_path_lock. Yields the patched Path."""
+    db_file = tmp_path / "locked-brain.db"
+    for mod_name in _DB_PATH_LOCK_MODULES:
+        mod = importlib.import_module(mod_name)
+        monkeypatch.setattr(mod, "DB_PATH", db_file, raising=False)
+        monkeypatch.setattr(mod, "_DB_PATH_LOCKED", True, raising=False)
+    return db_file
+
+
 @pytest.fixture
 def brain(tmp_path):
     """Return a Brain instance backed by a temp DB file."""

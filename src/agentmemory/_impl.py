@@ -931,7 +931,13 @@ def get_db() -> sqlite3.Connection:
     forget to add.
     """
     global DB_PATH, BLOBS_DIR, BACKUPS_DIR
-    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
+    # R2-B2 fix: get_db_path() itself checks BRAINCTL_DB first (the canonical
+    # go-forward name), but this gate only checked whether BRAIN_DB/BRAINCTL_HOME
+    # were set to decide whether to bother calling it -- a caller setting only
+    # BRAINCTL_DB was silently ignored, since the gate never fired at all.
+    if not _DB_PATH_LOCKED and (
+        os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
+    ):
         DB_PATH = get_db_path()
         BLOBS_DIR = get_blobs_dir()
         BACKUPS_DIR = get_backups_dir()
@@ -3192,7 +3198,7 @@ def cmd_memory_add(args):
                 candidates = db.execute(
                     "SELECT m.id, m.content, m.confidence, m.category, m.recalled_count "
                     "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                    "WHERE memories_fts MATCH ? AND m.agent_id = ? AND m.retired_at IS NULL "
+                    "WHERE memories_fts MATCH ? AND m.agent_id = ? AND m.retired_at IS NULL AND m.indexed = 1 "
                     "AND m.category = ? "
                     "ORDER BY f.rank LIMIT 5",
                     (fts_q, args.agent, args.category)
@@ -3527,7 +3533,7 @@ def cmd_memory_search(args):
             rows = db.execute(
                 f"SELECT m.*, {_BM25_MEMORIES_EXPR} as fts_rank "
                 "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL "
+                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 "
                 f"ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
                 (fts_query, fetch_limit)
             ).fetchall()
@@ -5888,7 +5894,7 @@ def _surprise_score(db, content: str, blob=None):
             return 0.5, "fts5_no_query_neutral"
         rows = db.execute(
             "SELECT m.content FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL ORDER BY rank LIMIT 5",
+            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 ORDER BY rank LIMIT 5",
             (fts_query,)
         ).fetchall()
         if not rows:
@@ -6479,7 +6485,7 @@ def cmd_search(args, *, db=None, db_path: Optional[str] = None):
             "m.encoding_task_context, m.encoding_context_hash, m.q_value, m.confidence_phase, "
             "m.trust_score, m.replay_priority "
             "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL "
+            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 "
             "AND COALESCE(m.memory_type, 'episodic') != 'procedural' "
             "ORDER BY bm25(memories_fts, 3.0, 1.0, 1.0) LIMIT ?",
             (fts_query, fetch_limit)
@@ -14178,7 +14184,7 @@ def cmd_push(args):
         rows = db.execute(
             f"SELECT m.id, 'memory' as type, m.category, m.content, m.confidence, m.scope, m.created_at, {_BM25_MEMORIES_EXPR} as fts_rank "
             "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
+            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
             (fts_query, fetch_limit)
         ).fetchall()
         return rows_to_list(rows)
@@ -15977,7 +15983,7 @@ def _reason_l1_search(db, query: str, limit: int = 10):
         rows = db.execute(
             f"SELECT m.id, 'memory' as type, m.category, m.content, m.confidence, m.scope, m.created_at, {_BM25_MEMORIES_EXPR} as fts_rank "
             "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
+            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
             (fts_query, fetch_limit)
         ).fetchall()
         fts_mems = rows_to_list(rows)
@@ -16373,7 +16379,7 @@ def cmd_infer_pretask(args):
         try:
             mem_rows = db.execute(
                 "SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.confidence < 0.7 "
+                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 AND m.confidence < 0.7 "
                 f"ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
                 (fts_q, limit * 3)
             ).fetchall()

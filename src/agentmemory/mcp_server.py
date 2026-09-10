@@ -285,7 +285,12 @@ _now_ts = now_iso
 
 def get_db() -> sqlite3.Connection:
     global DB_PATH
-    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
+    # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
+    # gate must also recognize BRAINCTL_DB, the canonical go-forward name
+    # get_db_path() itself already checks first.
+    if not _DB_PATH_LOCKED and (
+        os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
+    ):
         DB_PATH = get_db_path()
 
     if "PYTEST_CURRENT_TEST" in os.environ:
@@ -314,6 +319,46 @@ def get_db() -> sqlite3.Connection:
 _FTS_REBUILD_CHECKED_PATHS: set = set()
 
 
+def _cold_start_check_once(conn, db_path) -> bool:
+    """Run _ensure_fts_index_consistent at most once per (path, file state)
+    per process. Pulled out of memory_search's body into its own callable
+    unit (2026-09-10) specifically so it can be unit tested directly --
+    Ari's REV2 review caught that the original F7 test never touched this
+    real guard at all, only a throwaway local set built for the test itself.
+
+    R2-F3 fix included here: keying on path alone meant replacing the file
+    at the same path (a fresh/underpopulated db swapped in under the same
+    name) was silently skipped, since the path had already been marked
+    checked. Folding in mtime+size means a real file replacement (which
+    changes at least one of those in virtually every real scenario) is
+    treated as a new identity needing its own check.
+
+    Returns True if a check+possible-repair actually ran this call, False if
+    this exact (path, state) was already checked.
+    """
+    try:
+        _stat = os.stat(db_path)
+        db_key = f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+    except OSError:
+        db_key = str(db_path)
+    if db_key in _FTS_REBUILD_CHECKED_PATHS:
+        return False
+    _ensure_fts_index_consistent(conn)
+    _FTS_REBUILD_CHECKED_PATHS.add(db_key)
+    return True
+
+
+def _commit_if_owned(conn, had_txn: bool) -> None:
+    """R2-F1 fix: a helper that unconditionally calls conn.commit() finalizes
+    whatever unrelated work the CALLER already had pending in an open
+    transaction, not just its own changes -- confirmed as a real defect by
+    Ari's REV2 review. Only commit if this call is the one that opened the
+    transaction (i.e. conn.in_transaction was already False when it started);
+    otherwise leave the commit/rollback decision to whoever owns it."""
+    if not had_txn:
+        conn.commit()
+
+
 def _ensure_fts_index_consistent(conn) -> bool:
     """Detect and repair a corrupt ``memories_fts`` index.
 
@@ -336,16 +381,21 @@ def _ensure_fts_index_consistent(conn) -> bool:
     the index was already healthy, the schema isn't initialized, or
     there are no memories to back an index against.
     """
-    try:
-        active = conn.execute(
-            "SELECT count(*) FROM memories "
-            "WHERE retired_at IS NULL AND indexed = 1"
-        ).fetchone()[0]
-    except sqlite3.Error:
-        return False
+    # R2-F1: capture this BEFORE any write, so a caller's own already-open
+    # transaction is never finalized by this function's commits below.
+    had_txn = conn.in_transaction
 
-    if not active:
-        return False
+    try:
+        conn.execute("SELECT count(*) FROM memories LIMIT 1")
+    except sqlite3.Error:
+        return False  # schema not initialized -- nothing to check against
+
+    # R2-B1 fix: this used to short-circuit on zero eligible rows ("nothing
+    # to index against"), which also meant it never noticed *stale ineligible*
+    # rows already sitting in the raw FTS index when the eligible set is
+    # legitimately empty (e.g. every memory retired). Zero eligible rows is a
+    # real, valid state to check membership against -- it should mean raw FTS
+    # is also empty, not skip the check entirely.
 
     # Cold-start / under-populated case (issue #151), sharpened for B4: a
     # count comparison alone (indexed_docs < active) misses the case where
@@ -372,7 +422,7 @@ def _ensure_fts_index_consistent(conn) -> bool:
                 "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
             )
             _purge_ineligible_fts_rows(conn)
-            conn.commit()
+            _commit_if_owned(conn, had_txn)
             return True
         except sqlite3.Error:
             return False
@@ -387,7 +437,7 @@ def _ensure_fts_index_consistent(conn) -> bool:
                 "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
             )
             _purge_ineligible_fts_rows(conn)
-            conn.commit()
+            _commit_if_owned(conn, had_txn)
             return True
         except sqlite3.Error:
             return False
@@ -491,23 +541,36 @@ def _ensure_fts_triggers_scoped(conn) -> bool:
         return False
     if rows == canonical:
         return False
+    # R2-F1: capture before any write so a caller's own already-open
+    # transaction is never finalized by this function's commit.
+    had_txn = conn.in_transaction
     # Python's sqlite3.executescript() implicitly COMMITs any pending
     # transaction before running -- that would silently end the SAVEPOINT
     # below before it could protect anything (confirmed the hard way while
     # writing this fix's own tests). Run each complete statement individually
     # via execute() instead, so the SAVEPOINT actually stays open throughout.
+    savepoint_open = False
     try:
         conn.execute("SAVEPOINT fts_trigger_repair")
+        savepoint_open = True
         for stmt in _SCOPED_FTS_UPDATE_STATEMENTS:
             conn.execute(stmt)
         conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         _purge_ineligible_fts_rows(conn)
         conn.execute("RELEASE fts_trigger_repair")
-        conn.commit()
+        _commit_if_owned(conn, had_txn)
         return True
     except sqlite3.Error:
-        conn.execute("ROLLBACK TO fts_trigger_repair")
-        conn.execute("RELEASE fts_trigger_repair")
+        # R2-F2: if SAVEPOINT itself never succeeded, it doesn't exist --
+        # attempting ROLLBACK TO/RELEASE on a savepoint that was never opened
+        # raises its own fresh, unhandled error instead of returning the
+        # documented False. Only attempt cleanup if we know it's really there.
+        if savepoint_open:
+            try:
+                conn.execute("ROLLBACK TO fts_trigger_repair")
+                conn.execute("RELEASE fts_trigger_repair")
+            except sqlite3.Error:
+                pass
         return False
 
 
@@ -1153,14 +1216,10 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     if not fts_q:
         return {"ok": False, "error": "Empty query"}
 
-    # Cold-start FTS health check (issue #97-2). The platform startup script
-    # is supposed to rebuild the FTS index, but a silent failure leaves
-    # search returning zero hits despite a populated memories table.
-    # Rebuild once per process if the index looks short.
-    _db_key = str(DB_PATH)
-    if _db_key not in _FTS_REBUILD_CHECKED_PATHS:
-        _ensure_fts_index_consistent(db)
-        _FTS_REBUILD_CHECKED_PATHS.add(_db_key)
+    # Cold-start FTS health check (issue #97-2), once per (db, its current
+    # file state) -- see _cold_start_check_once() for the guard logic itself,
+    # pulled out as its own unit so it's directly testable (R2-F3/F7).
+    _cold_start_check_once(db, DB_PATH)
 
     # Theta-gamma slot cap — enforce 7*tier max slots per retrieval cycle.
     # Tier 1 (default) → 7 slots, tier 2 → 14, tier 3 → 21.
@@ -1172,7 +1231,12 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     max_slots = 7 * tier
     limit = min(limit, max_slots)
 
-    conditions = ["m.retired_at IS NULL"]
+    # R2-B1 defense in depth: filter indexed=1 at the query level too, not
+    # just at write time. Rebuild/repair paths are the primary fix, but a
+    # read-path filter means a construct-only (indexed=0) row can never
+    # surface through ordinary search even if raw FTS membership ever drifts
+    # again for a reason nobody's found yet.
+    conditions = ["m.retired_at IS NULL", "m.indexed = 1"]
     params = [fts_q]
     if borrow_from:
         # Cross-agent borrow: restrict to the other agent's globally-scoped memories
@@ -2181,7 +2245,7 @@ def tool_search(agent_id: str, query: str, limit: int = 20, vector: bool = False
     results = []
 
     if "memories" in intent_tables:
-        _mem_conditions = ["m.retired_at IS NULL"]
+        _mem_conditions = ["m.retired_at IS NULL", "m.indexed = 1"]  # R2-B1 defense in depth
         _mem_params: list = [fts_q]
         if _profile_categories:
             ph = ",".join("?" * len(_profile_categories))
@@ -2903,15 +2967,12 @@ TOOLS = [
         },
     ),
     Tool(
-        name="brainctl_wrapup",
+        name="agent_wrap_up",
         description=(
-            "Writes brainctl continuity records only: one session_end event and one "
-            "pending handoff packet. This does NOT end your session, close your IDE, "
-            "or replace your own shutdown/wrap-up checklist -- it only leaves a note "
-            "so the next run's agent_orient (or a future brainctl_wrapup counterpart) "
-            "can find real context. Call it near the end of a session, alongside your "
-            "own shutdown steps, not instead of them. (Formerly named agent_wrap_up; "
-            "that name still works but is hidden from tool discovery.)"
+            "Single-call session end. Logs a session_end event AND creates a "
+            "pending handoff packet in one shot. Call at the end of every session "
+            "so the next run's agent_orient returns real context. Counterpart to "
+            "agent_orient."
         ),
         inputSchema={
             "type": "object",
@@ -3359,14 +3420,7 @@ try:
 except ImportError:
     _V2_DEPRECATED = frozenset()
 
-# Union in _V2_DEPRECATED here (not just `t.name for t in TOOLS`) so that a
-# deprecated name with no surviving Tool() object (e.g. agent_wrap_up, whose
-# entry was renamed to brainctl_wrapup 2026-08-10) is still recognized as a
-# *known, deprecated* name rather than falling through to "unknown" in
-# _resolve_allowed_tools() below -- without this, any agent whose
-# BRAINCTL_ALLOWED_TOOLS still explicitly names the old tool would hard-crash
-# at startup instead of getting the intended deprecation warning/passthrough.
-_ALL_TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOLS) | _V2_DEPRECATED
+_ALL_TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOLS)
 
 _VISIBLE_TOOL_NAMES: frozenset[str] = _ALL_TOOL_NAMES - _V2_DEPRECATED
 
@@ -3461,8 +3515,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         "handoff_pin": tool_handoff_pin,
         "handoff_expire": tool_handoff_expire,
         "agent_orient": tool_agent_orient,
-        "agent_wrap_up": tool_agent_wrap_up,  # deprecated name, hidden from discovery, still dispatchable
-        "brainctl_wrapup": tool_agent_wrap_up,  # new primary name, 2026-08-10 rename
+        "agent_wrap_up": tool_agent_wrap_up,
         "search": tool_search,
         "stats": tool_stats,
         "resolve_conflict": tool_resolve_conflict,

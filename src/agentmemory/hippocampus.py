@@ -94,7 +94,12 @@ def get_db() -> sqlite3.Connection:
     path while running under pytest, via the shared guard in _impl.py.
     """
     global DB_PATH
-    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
+    # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
+    # gate must also recognize BRAINCTL_DB, the canonical go-forward name
+    # get_db_path() itself already checks first.
+    if not _DB_PATH_LOCKED and (
+        os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
+    ):
         DB_PATH = get_db_path()
 
     if "PYTEST_CURRENT_TEST" in os.environ:
