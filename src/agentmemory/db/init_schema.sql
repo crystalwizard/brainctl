@@ -128,14 +128,14 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
     tokenize='porter unicode61'
 );
 
-CREATE TRIGGER memories_fts_insert AFTER INSERT ON memories WHEN new.indexed = 1 BEGIN
+CREATE TRIGGER memories_fts_insert AFTER INSERT ON memories WHEN new.indexed = 1 AND new.retired_at IS NULL BEGIN
     INSERT INTO memories_fts(rowid, content, category, tags) VALUES (new.id, new.content, new.category, new.tags);
 END;
 
 -- Update triggers scoped to FTS columns (plus indexed, retired_at) so
 -- metadata-only updates don't churn the index (issue #152). The
 -- retired_at IS NULL guard drops the re-insert at the retire transition.
-CREATE TRIGGER memories_fts_update_delete AFTER UPDATE OF content, category, tags, indexed, retired_at ON memories WHEN old.indexed = 1 BEGIN
+CREATE TRIGGER memories_fts_update_delete AFTER UPDATE OF content, category, tags, indexed, retired_at ON memories WHEN old.indexed = 1 AND old.retired_at IS NULL BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content, category, tags)
     VALUES ('delete', old.id, old.content, old.category, old.tags);
 END;
@@ -145,7 +145,7 @@ CREATE TRIGGER memories_fts_update_insert AFTER UPDATE OF content, category, tag
     VALUES (new.id, new.content, new.category, new.tags);
 END;
 
-CREATE TRIGGER memories_fts_delete AFTER DELETE ON memories BEGIN
+CREATE TRIGGER memories_fts_delete AFTER DELETE ON memories WHEN old.indexed = 1 AND old.retired_at IS NULL BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content, category, tags) VALUES('delete', old.id, old.content, old.category, old.tags);
 END;
 

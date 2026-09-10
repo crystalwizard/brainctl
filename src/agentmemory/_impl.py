@@ -9805,6 +9805,16 @@ def cmd_init(args):
         # nothing until a manual rebuild.
         try:
             conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            # B3: rebuild re-imports every memories row regardless of
+            # indexed/retired_at; purge anything ineligible right back out.
+            # Normally a no-op on a genuinely fresh DB, kept for defense in
+            # depth if init is ever pointed at a non-empty target.
+            conn.execute(
+                "INSERT INTO memories_fts(memories_fts, rowid, content, category, tags) "
+                "SELECT 'delete', m.id, m.content, m.category, m.tags "
+                "FROM memories m JOIN memories_fts_docsize d ON d.rowid = m.id "
+                "WHERE NOT (m.indexed = 1 AND m.retired_at IS NULL)"
+            )
             conn.commit()
         except sqlite3.Error:
             pass  # memories_fts may be absent in a minimal/partial schema

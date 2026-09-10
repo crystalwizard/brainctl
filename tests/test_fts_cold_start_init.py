@@ -52,18 +52,43 @@ def _run_brainctl(*args, db_path=None):
 
 
 def test_cmd_init_seeds_fts_index(tmp_path):
-    """A fresh ``init`` must prime the external-content FTS5 index: every
-    content row is indexed (docsize == memories count, non-empty)."""
+    """A fresh ``init`` must prime the external-content FTS5 index for real
+    (eligible) content -- every indexed=1, non-retired row is indexed.
+
+    Corrected 2026-09-10 per Ari's REV1 finding B3: the previous version of
+    this test asserted docsize == total memories count, which only ever
+    passed because a pre-fix rebuild also leaked cmd_init's own
+    deliberately-indexed=0 sentinel row ("Do not surface in regular
+    retrieval") into the raw FTS index. That was validating the bug, not
+    the fix. This version seeds one real, eligible memory directly and
+    checks only that eligible content is indexed -- the sentinel is
+    correctly expected to stay out.
+    """
     db = str(tmp_path / "brain.db")
     _run_brainctl("init", "--path", db)
 
     conn = sqlite3.connect(db)
+    now = "2026-09-10T12:00:00"
+    conn.execute(
+        "INSERT INTO memories (id, content, category, tags, indexed, agent_id, created_at, updated_at) "
+        "VALUES (100, 'real eligible content for cold-start seeding', 'general', '', 1, 'test', ?, ?)",
+        (now, now),
+    )
+    conn.commit()
+    _run_brainctl("init", "--path", db)  # idempotent re-run should (re-)seed without duplicating
+
+    eligible = conn.execute(
+        "SELECT count(*) FROM memories WHERE indexed = 1 AND retired_at IS NULL"
+    ).fetchone()[0]
     docsize = conn.execute("SELECT count(*) FROM memories_fts_docsize").fetchone()[0]
-    mem = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    indexed_ids = set(r[0] for r in conn.execute("SELECT rowid FROM memories_fts_docsize").fetchall())
+    sentinel_indexed = 1 in indexed_ids
     conn.close()
 
-    assert mem > 0, "init seeds at least one memory row"
-    assert docsize == mem, "every content row must be in the FTS index after init"
+    assert eligible >= 1, "test seeded at least one eligible memory"
+    assert 100 in indexed_ids, "the real eligible memory must be indexed after init"
+    assert docsize == eligible, "docsize must equal exactly the eligible set, no more"
+    assert not sentinel_indexed, "the indexed=0 sentinel memory must never surface in the raw FTS index"
 
 
 def _seed_unindexed(db_path: Path) -> sqlite3.Connection:

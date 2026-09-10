@@ -17,6 +17,12 @@
 
 INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
 
+-- B3: same as migration 083 -- rebuild re-imports ineligible rows too.
+INSERT INTO memories_fts(memories_fts, rowid, content, category, tags)
+SELECT 'delete', m.id, m.content, m.category, m.tags
+FROM memories m JOIN memories_fts_docsize d ON d.rowid = m.id
+WHERE NOT (m.indexed = 1 AND m.retired_at IS NULL);
+
 INSERT OR IGNORE INTO schema_version (version, description, applied_at)
 VALUES (84, 'rebuild memories_fts on cold-start (issue #151)',
         strftime('%Y-%m-%dT%H:%M:%S', 'now'));

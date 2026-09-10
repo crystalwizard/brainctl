@@ -25,3 +25,4 @@ config/distill-cron.sh
 
 # Next.js build artifacts (in case something runs 'next build' from this repo cwd by accident)
 .next/
+.test-venv/

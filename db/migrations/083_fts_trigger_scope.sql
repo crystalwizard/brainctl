@@ -26,6 +26,15 @@ END;
 
 INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
 
+-- B3: external-content rebuild re-imports every row in `memories` regardless
+-- of indexed/retired_at. Purge anything that isn't eligible right back out
+-- of the raw index so a construct-only or retired row never surfaces through
+-- ordinary search.
+INSERT INTO memories_fts(memories_fts, rowid, content, category, tags)
+SELECT 'delete', m.id, m.content, m.category, m.tags
+FROM memories m JOIN memories_fts_docsize d ON d.rowid = m.id
+WHERE NOT (m.indexed = 1 AND m.retired_at IS NULL);
+
 INSERT OR IGNORE INTO schema_version (version, description, applied_at)
 VALUES (83, 'scope memories_fts update triggers (issue #152)',
         strftime('%Y-%m-%dT%H:%M:%S', 'now'));

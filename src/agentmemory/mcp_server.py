@@ -307,7 +307,11 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-_FTS_REBUILD_CHECKED = False
+# F7 fix, 2026-09-10: was a single global bool, so a healthy first database
+# in a process permanently skipped the check for every other database opened
+# afterward in the same process. Keyed by resolved db path instead, so each
+# distinct database gets its own one-time check.
+_FTS_REBUILD_CHECKED_PATHS: set = set()
 
 
 def _ensure_fts_index_consistent(conn) -> bool:
@@ -343,23 +347,31 @@ def _ensure_fts_index_consistent(conn) -> bool:
     if not active:
         return False
 
-    # Cold-start / under-populated case (issue #151): an external-content
-    # FTS5 index that was never seeded is *empty*, not *corrupt*, so
-    # 'integrity-check' below passes and the rows stay unfindable. The
-    # ``memories_fts_docsize`` shadow table holds one row per indexed
-    # document; when it lags the active-indexed count, the inverted index
-    # is missing documents and must be rebuilt.
+    # Cold-start / under-populated case (issue #151), sharpened for B4: a
+    # count comparison alone (indexed_docs < active) misses the case where
+    # the raw FTS docid set has the SAME OR GREATER count as eligible memories
+    # but the WRONG membership (some eligible ids missing, masked by other,
+    # ineligible ids also present from an earlier bad rebuild). Compare the
+    # actual id sets, not just their sizes.
     try:
-        indexed_docs = conn.execute(
-            "SELECT count(*) FROM memories_fts_docsize"
-        ).fetchone()[0]
+        eligible_ids = set(
+            r[0] for r in conn.execute(
+                "SELECT id FROM memories WHERE retired_at IS NULL AND indexed = 1"
+            ).fetchall()
+        )
+        indexed_ids = set(
+            r[0] for r in conn.execute(
+                "SELECT rowid FROM memories_fts_docsize"
+            ).fetchall()
+        )
     except sqlite3.Error:
-        indexed_docs = None
-    if indexed_docs is not None and indexed_docs < active:
+        indexed_ids = None
+    if indexed_ids is not None and indexed_ids != eligible_ids:
         try:
             conn.execute(
                 "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
             )
+            _purge_ineligible_fts_rows(conn)
             conn.commit()
             return True
         except sqlite3.Error:
@@ -374,6 +386,7 @@ def _ensure_fts_index_consistent(conn) -> bool:
             conn.execute(
                 "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
             )
+            _purge_ineligible_fts_rows(conn)
             conn.commit()
             return True
         except sqlite3.Error:
@@ -383,38 +396,118 @@ def _ensure_fts_index_consistent(conn) -> bool:
     return False
 
 
-_SCOPED_FTS_UPDATE_TRIGGERS = """
-DROP TRIGGER IF EXISTS memories_fts_update_delete;
-DROP TRIGGER IF EXISTS memories_fts_update_insert;
-CREATE TRIGGER memories_fts_update_delete AFTER UPDATE OF content, category, tags, indexed, retired_at ON memories WHEN old.indexed = 1 BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content, category, tags)
-    VALUES ('delete', old.id, old.content, old.category, old.tags);
-END;
-CREATE TRIGGER memories_fts_update_insert AFTER UPDATE OF content, category, tags, indexed, retired_at ON memories WHEN new.indexed = 1 AND new.retired_at IS NULL BEGIN
-    INSERT INTO memories_fts(rowid, content, category, tags)
-    VALUES (new.id, new.content, new.category, new.tags);
-END;
-"""
+# Individual complete statements, not one blob to be split on ";" -- each
+# CREATE TRIGGER body contains its own internal semicolons, so a naive split
+# breaks them into invalid fragments (confirmed the hard way: "incomplete
+# input"). Each tuple entry is passed whole to conn.execute().
+# Formatting (line breaks, indentation) matters here, not just for style:
+# SQLite stores each trigger's CREATE statement verbatim in sqlite_master,
+# and _ensure_fts_triggers_scoped compares that text byte-for-byte against
+# these strings to decide whether a repair is a no-op. They must match
+# init_schema.sql's own trigger text exactly, or a freshly-initialized,
+# already-correct database gets misdiagnosed as needing repair.
+_SCOPED_FTS_UPDATE_STATEMENTS = (
+    "DROP TRIGGER IF EXISTS memories_fts_update_delete",
+    "DROP TRIGGER IF EXISTS memories_fts_update_insert",
+    "CREATE TRIGGER memories_fts_update_delete AFTER UPDATE OF content, category, tags, indexed, retired_at "
+    "ON memories WHEN old.indexed = 1 AND old.retired_at IS NULL BEGIN\n"
+    "    INSERT INTO memories_fts(memories_fts, rowid, content, category, tags)\n"
+    "    VALUES ('delete', old.id, old.content, old.category, old.tags);\n"
+    "END",
+    "CREATE TRIGGER memories_fts_update_insert AFTER UPDATE OF content, category, tags, indexed, retired_at "
+    "ON memories WHEN new.indexed = 1 AND new.retired_at IS NULL BEGIN\n"
+    "    INSERT INTO memories_fts(rowid, content, category, tags)\n"
+    "    VALUES (new.id, new.content, new.category, new.tags);\n"
+    "END",
+)
+_SCOPED_FTS_UPDATE_TRIGGERS = ";\n".join(_SCOPED_FTS_UPDATE_STATEMENTS) + ";"
+
+
+# Canonical trigger SQL, exactly as SQLite echoes it back via sqlite_master,
+# used for exact-match detection below. Built by actually creating a scratch
+# in-memory schema rather than hand-typed, so this can never drift from what
+# CREATE TRIGGER above actually produces.
+def _canonical_fts_update_triggers() -> dict:
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.executescript(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, category TEXT, "
+            "tags TEXT, indexed INTEGER, retired_at TEXT);"
+            "CREATE VIRTUAL TABLE memories_fts USING fts5(content, category, tags, "
+            "content=memories, content_rowid=id);"
+            + _SCOPED_FTS_UPDATE_TRIGGERS
+        )
+        return dict(
+            scratch.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('memories_fts_update_delete', 'memories_fts_update_insert')"
+            ).fetchall()
+        )
+    finally:
+        scratch.close()
+
+
+def _purge_ineligible_fts_rows(conn) -> None:
+    """After any 'rebuild', external-content FTS5 has re-imported every row
+    in ``memories`` regardless of indexed/retired_at (B3) -- remove anything
+    that shouldn't be searchable. Safe to call even when nothing needs it."""
+    conn.execute(
+        "INSERT INTO memories_fts(memories_fts, rowid, content, category, tags) "
+        "SELECT 'delete', m.id, m.content, m.category, m.tags "
+        "FROM memories m JOIN memories_fts_docsize d ON d.rowid = m.id "
+        "WHERE NOT (m.indexed = 1 AND m.retired_at IS NULL)"
+    )
 
 
 def _ensure_fts_triggers_scoped(conn) -> bool:
-    """Replace legacy unscoped memories_fts update triggers with column-scoped
-    ones (issue #152). Idempotent; returns True only if it rewrote them."""
+    """Replace legacy/incomplete/malformed memories_fts update triggers with
+    the exact column-scoped pair (issue #152). Idempotent; returns True only
+    if it actually rewrote them.
+
+    B1 fix: the old check accepted any trigger whose SQL merely contained the
+    substring "AFTER UPDATE OF" -- true for a single stray trigger, for the
+    wrong column list, or for a no-op body. Now compares each trigger's exact
+    SQL text (both name and body) against the canonical definition; anything
+    short of an exact match on BOTH triggers triggers a real repair, including
+    the case where one or both are missing entirely (previously misread as
+    "no rows to fix").
+
+    B2 fix: the DROP+CREATE used to run as a bare executescript, so a CREATE
+    failure after a successful DROP left the database with neither trigger
+    (caught by returning False, indistinguishable from a healthy no-op). Now
+    runs inside a SAVEPOINT that's explicitly rolled back on any error, so a
+    failed repair always leaves the original pair (broken or not) untouched
+    rather than deleting it.
+    """
+    canonical = _canonical_fts_update_triggers()
     try:
-        rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' "
-            "AND name IN ('memories_fts_update_delete', 'memories_fts_update_insert')"
-        ).fetchall()
+        rows = dict(
+            conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('memories_fts_update_delete', 'memories_fts_update_insert')"
+            ).fetchall()
+        )
     except sqlite3.Error:
         return False
-    if not rows or all(r[0] and "AFTER UPDATE OF" in r[0].upper() for r in rows):
+    if rows == canonical:
         return False
+    # Python's sqlite3.executescript() implicitly COMMITs any pending
+    # transaction before running -- that would silently end the SAVEPOINT
+    # below before it could protect anything (confirmed the hard way while
+    # writing this fix's own tests). Run each complete statement individually
+    # via execute() instead, so the SAVEPOINT actually stays open throughout.
     try:
-        conn.executescript(_SCOPED_FTS_UPDATE_TRIGGERS)
+        conn.execute("SAVEPOINT fts_trigger_repair")
+        for stmt in _SCOPED_FTS_UPDATE_STATEMENTS:
+            conn.execute(stmt)
         conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        _purge_ineligible_fts_rows(conn)
+        conn.execute("RELEASE fts_trigger_repair")
         conn.commit()
         return True
     except sqlite3.Error:
+        conn.execute("ROLLBACK TO fts_trigger_repair")
+        conn.execute("RELEASE fts_trigger_repair")
         return False
 
 
@@ -1064,10 +1157,10 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     # is supposed to rebuild the FTS index, but a silent failure leaves
     # search returning zero hits despite a populated memories table.
     # Rebuild once per process if the index looks short.
-    global _FTS_REBUILD_CHECKED
-    if not _FTS_REBUILD_CHECKED:
+    _db_key = str(DB_PATH)
+    if _db_key not in _FTS_REBUILD_CHECKED_PATHS:
         _ensure_fts_index_consistent(db)
-        _FTS_REBUILD_CHECKED = True
+        _FTS_REBUILD_CHECKED_PATHS.add(_db_key)
 
     # Theta-gamma slot cap — enforce 7*tier max slots per retrieval cycle.
     # Tier 1 (default) → 7 slots, tier 2 → 14, tier 3 → 21.
