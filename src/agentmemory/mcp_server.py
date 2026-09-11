@@ -364,10 +364,39 @@ def get_db() -> sqlite3.Connection:
 # genuinely different db carrying that same stamp at the same path -- a real
 # tool_memory_search still skipped repair. Bounding the cache with a TTL
 # caps the worst-case staleness window instead of chasing a perfect identity
-# signal that can't exist. Values are time.monotonic() timestamps of the last
-# check, not booleans -- `.clear()` still works the same for existing tests.
+# signal that can't exist.
+#
+# R8 fix (Ari's independent REV8 audit, 2026-09-11): values are now
+# `(time.monotonic() timestamp, (mtime_ns, size) or None)` tuples, not bare
+# timestamps -- see _cold_start_check_once's own docstring for why the file
+# fingerprint half exists. `.clear()` still works the same for existing tests.
 _FTS_REBUILD_CHECKED_PATHS: dict = {}
 _FTS_REBUILD_CHECK_TTL_SECONDS = 300
+
+
+def invalidate_fts_check_cache(db_path) -> None:
+    """Explicit invalidation hook (Ari's independent REV8 audit, 2026-09-11
+    -- honoring the "actual caller and tested path" invalidation protocol
+    his R7-B1 report asked for, rather than chasing a passive signal that
+    can't be made airtight on this schema/filesystem -- see the measured
+    reasoning in _cold_start_check_once's own docstring).
+
+    Any code path that replaces a brain.db file wholesale IN this process
+    (a restore command, a backup-restore script, a migration tool) should
+    call this as its last step, with the SAME db_path passed to
+    _cold_start_check_once elsewhere. It forces the next call for that
+    path to run a full check unconditionally, regardless of the cached
+    instance stamp, file fingerprint, or TTL -- an airtight guarantee the
+    passive mtime/size layer cannot promise on its own, since it depends
+    on nothing but "some caller told the truth about when a restore
+    happened," not on any inferred filesystem signal.
+
+    No restore function exists in this codebase yet to call this from --
+    documented honestly as the real, current gap, not silently assumed
+    away. Safe to call even if db_path was never checked (no-op)."""
+    prefix = f"{db_path}:"
+    for key in [k for k in _FTS_REBUILD_CHECKED_PATHS if k.startswith(prefix) or k == str(db_path)]:
+        del _FTS_REBUILD_CHECKED_PATHS[key]
 
 
 def _db_instance_id(conn) -> str | None:
@@ -447,18 +476,76 @@ def _cold_start_check_once(conn, db_path) -> bool:
     window. Comparing (COUNT, SUM(id)) instead of COUNT alone is still one
     cheap index-backed aggregate query per side -- no real cost increase --
     but two different id sets landing on both the same count AND the same
-    sum is a materially harder coincidence than matching count alone. This
-    is a strengthened cheap proxy for the real invariant, not a claim of
-    exact equivalence to the full id-set comparison in
-    _ensure_fts_index_consistent -- Ari's own wording ("do not replace the
-    full invariant with a count-only subcase") is honored by making the
-    per-call shortcut harder to fool, not by pretending it's the full check.
-    The full id-set comparison remains the authority whenever this
-    fingerprint actually mismatches or the TTL genuinely expires.
+    sum is a materially harder coincidence than matching count alone.
 
-    Returns True if a check+possible-repair actually ran this call, False if
-    the fingerprint matched and this exact (path, instance) was checked
-    within the last _FTS_REBUILD_CHECK_TTL_SECONDS.
+    R8-B3 fix (Ari's independent REV8 audit, 2026-09-11): the real
+    production connection (get_db()) sets row_factory=sqlite3.Row. The two
+    fingerprint queries have different result-column names (SUM(id) vs
+    SUM(rowid)), and sqlite3.Row equality considers column names as well
+    as values -- so the fingerprint comparison was ALWAYS unequal in
+    production regardless of the actual numbers, silently forcing the
+    full check on every single call and defeating the entire point of
+    this shortcut. Only my own ad-hoc plain sqlite3.connect() test
+    harness (default tuple row_factory) ever exercised the path where
+    they could compare equal. Both fingerprints are now cast to plain
+    tuples before comparing, so only the values matter.
+
+    R8-B1 fix, this function's own share of it (Ari's independent REV8
+    audit, 2026-09-11): neither the cheap fingerprint nor the TTL bound
+    can guarantee the FIRST search after a restore is correct -- the
+    fingerprint can't see a same-count-same-sum collision or a same-id
+    stale-CONTENT restore (that one is _ensure_fts_index_consistent's own
+    fix, see its docstring), and the TTL is a bound on how long staleness
+    is *tolerated*, not a promise it never happens on the very next call.
+    But the actual scenario all of this exists for -- a real restore -- is
+    a real file write, and a real file write reliably advances the file's
+    mtime (often its size too). This is NOT reintroducing mtime/size as
+    database IDENTITY (R3-B1 already established that's unsafe, due to
+    granularity/same-size collisions) -- it's used only as a one-way
+    trigger, layered on top of the existing instance-stamp keying, not
+    instead of it: "this file was touched since the last time I looked at
+    it" forces an immediate full check regardless of what the cheap
+    fingerprint says. A false negative here (an adversarial restore that
+    happens to land on an identical mtime AND size) falls back to exactly
+    the same TTL-bounded staleness as before R8 -- no worse than before.
+    A true positive (the overwhelming common case for any real restore
+    mechanism: cp, rsync, a backup tool, a plain file replace) is what
+    actually closes Ari's first-public-search requirement.
+
+    Measured honestly, not assumed: on THIS schema, mtime/size is a
+    strictly weaker signal than it sounds. Every database built from
+    init_schema.sql pre-allocates ~587 pages for the schema itself
+    (tables/indices/triggers/FTS shadow tables), and a handful of test-
+    scale content rows never cross that page count -- so st_size is
+    provably identical across two genuinely different small databases
+    sharing this schema, not just occasionally. st_mtime_ns has a
+    measured ~2-second granularity on this filesystem (NTFS via this
+    project's own scratch temp directory), so two real writes within that window are
+    indistinguishable by mtime too. (PRAGMA data_version and the SQLite
+    file-header change counter were also measured directly and rejected
+    for the same reason: the former is scoped per-connection, not
+    per-file, so a fresh connection's baseline reading carries no memory
+    of a previous connection's state; the latter tracks transaction
+    COUNT, and this test harness's schema-init + content-insert sequence
+    happens to land both scenarios on an identical count regardless of
+    row content.) So: real, valuable, but not airtight -- a restore
+    landing inside that ~2-second/same-page-count window is invisible to
+    this layer and falls back to the TTL bound, same as before R8.
+
+    For exactly that reason, invalidate_fts_check_cache() below exists as
+    the "actual caller and tested path" for explicit invalidation Ari's
+    own R7-B1 report asked for -- any future restore tooling (a real
+    `brainctl restore` command, a backup-restore script) that runs IN
+    this process should call it as its last step, and gets an airtight
+    guarantee this passive layer alone cannot promise. Today, restores in
+    this codebase happen entirely out-of-band (no in-process restore
+    function exists to wire it into yet) -- documented here rather than
+    silently assumed solved.
+
+    Returns True if a check+possible-repair actually ran this call, False
+    if the file wasn't touched, the fingerprint matched, and this exact
+    (path, instance) was checked within the last
+    _FTS_REBUILD_CHECK_TTL_SECONDS.
     """
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
@@ -471,27 +558,39 @@ def _cold_start_check_once(conn, db_path) -> bool:
             db_key = str(db_path)
 
     try:
-        # R7-B1: (COUNT, SUM(id)) fingerprint, not COUNT alone -- see the
-        # docstring above. COALESCE guards the empty-set case, where SUM is
-        # NULL rather than 0 and would otherwise compare unequal to itself.
-        eligible_fp = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM memories "
-            "WHERE retired_at IS NULL AND indexed = 1"
-        ).fetchone()
-        indexed_fp = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(rowid), 0) FROM memories_fts_docsize"
-        ).fetchone()
-        counts_mismatched = eligible_fp != indexed_fp
-    except sqlite3.Error:
-        counts_mismatched = False  # schema not initialized -- let the normal path's own try/except handle it
+        _stat = os.stat(db_path)
+        file_fp = (_stat.st_mtime_ns, _stat.st_size)
+    except OSError:
+        file_fp = None
 
     now = time.monotonic()
-    if not counts_mismatched:
-        last_checked = _FTS_REBUILD_CHECKED_PATHS.get(db_key)
-        if last_checked is not None and (now - last_checked) < _FTS_REBUILD_CHECK_TTL_SECONDS:
-            return False
+    cached = _FTS_REBUILD_CHECKED_PATHS.get(db_key)
+
+    if cached is not None:
+        last_checked, cached_file_fp = cached
+        file_touched = (
+            file_fp is not None and cached_file_fp is not None and file_fp != cached_file_fp
+        )
+        if not file_touched and (now - last_checked) < _FTS_REBUILD_CHECK_TTL_SECONDS:
+            try:
+                # (COUNT, SUM(id)) fingerprint -- see R7-B1/R8-B3 above.
+                # COALESCE guards the empty-set case, where SUM is NULL
+                # rather than 0 and would otherwise compare unequal to itself.
+                eligible_fp = tuple(conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM memories "
+                    "WHERE retired_at IS NULL AND indexed = 1"
+                ).fetchone())
+                indexed_fp = tuple(conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(rowid), 0) FROM memories_fts_docsize"
+                ).fetchone())
+                counts_mismatched = eligible_fp != indexed_fp
+            except sqlite3.Error:
+                counts_mismatched = False  # schema not initialized -- let the normal path's own try/except handle it
+            if not counts_mismatched:
+                return False
+
     _ensure_fts_index_consistent(conn)
-    _FTS_REBUILD_CHECKED_PATHS[db_key] = now
+    _FTS_REBUILD_CHECKED_PATHS[db_key] = (now, file_fp)
     return True
 
 
@@ -507,7 +606,7 @@ def _commit_if_owned(conn, had_txn: bool) -> None:
 
 
 def _ensure_fts_index_consistent(conn) -> bool:
-    """Detect and repair a corrupt ``memories_fts`` index.
+    """Detect and repair a corrupt or stale ``memories_fts`` index.
 
     Issue #97 (issue 2): on some platforms the startup-script FTS rebuild
     silently fails or never runs, leaving a populated ``memories`` table
@@ -516,17 +615,35 @@ def _ensure_fts_index_consistent(conn) -> bool:
     workaround was a manual rebuild via
     ``INSERT INTO memories_fts(memories_fts) VALUES('rebuild')``.
 
-    External-content FTS5 (the shape ``memories_fts`` uses,
-    ``content=memories, content_rowid=id``) cannot be verified by row
-    counts: ``COUNT(*)`` on the FTS table reads through to the source
-    table whether or not the inverted index is built. Instead we use the
-    FTS5 ``'integrity-check'`` command, which raises
-    ``sqlite3.DatabaseError`` when the index is inconsistent — that's
-    the canonical way SQLite tells us the index is broken.
+    R8-B1 fix (Ari's independent REV8 audit, 2026-09-11): this used to
+    branch on two structural checks -- an id-SET comparison (eligible ids
+    vs raw FTS docids) and FTS5's own ``'integrity-check'`` command -- and
+    only rebuild when one of those flagged a problem. Both checks verify
+    *which ids are present*, never *whether the indexed text for a
+    present id still matches the current* ``memories.content`` *value at
+    that id*. A restored database can carry a raw FTS entry for the SAME
+    id whose tokenized text is stale relative to the real row; neither
+    check can ever see that, so the old logic left this case permanently
+    unrepaired -- not just bounded by the caller's TTL, genuinely never
+    fixed. Ari proved this directly: a same-id, same-count, same-sum
+    restore with stale indexed text still returned the wrong search
+    results even after simulating the TTL's expiry and letting this
+    function run to completion.
+
+    The only mechanism that actually guarantees content freshness is a
+    real rebuild, which recomputes every FTS posting directly from
+    ``memories.content``. This function is only ever reached rarely,
+    gated by ``_cold_start_check_once``'s own TTL/instance-stamp
+    bookkeeping -- so rebuilding unconditionally whenever it *does* run
+    is the same cost class as the old id-mismatch rebuild path for the
+    common healthy case, and it closes an otherwise-permanent gap for the
+    restored-with-stale-postings case. It also subsumes the original
+    structural-corruption motivation (issue #97) for free: a rebuild
+    fixes that too, by construction, so the separate integrity-check is
+    no longer needed as a distinct code path.
 
     Returns ``True`` if a rebuild was actually performed, ``False`` if
-    the index was already healthy, the schema isn't initialized, or
-    there are no memories to back an index against.
+    the schema isn't initialized (nothing to check or rebuild against).
     """
     # R2-F1: capture this BEFORE any write, so a caller's own already-open
     # transaction is never finalized by this function's commits below.
@@ -543,60 +660,13 @@ def _ensure_fts_index_consistent(conn) -> bool:
     except sqlite3.Error:
         return False  # schema not initialized -- nothing to check against
 
-    # R2-B1 fix: this used to short-circuit on zero eligible rows ("nothing
-    # to index against"), which also meant it never noticed *stale ineligible*
-    # rows already sitting in the raw FTS index when the eligible set is
-    # legitimately empty (e.g. every memory retired). Zero eligible rows is a
-    # real, valid state to check membership against -- it should mean raw FTS
-    # is also empty, not skip the check entirely.
-
-    # Cold-start / under-populated case (issue #151), sharpened for B4: a
-    # count comparison alone (indexed_docs < active) misses the case where
-    # the raw FTS docid set has the SAME OR GREATER count as eligible memories
-    # but the WRONG membership (some eligible ids missing, masked by other,
-    # ineligible ids also present from an earlier bad rebuild). Compare the
-    # actual id sets, not just their sizes.
     try:
-        eligible_ids = set(
-            r[0] for r in conn.execute(
-                "SELECT id FROM memories WHERE retired_at IS NULL AND indexed = 1"
-            ).fetchall()
-        )
-        indexed_ids = set(
-            r[0] for r in conn.execute(
-                "SELECT rowid FROM memories_fts_docsize"
-            ).fetchall()
-        )
-    except sqlite3.Error:
-        indexed_ids = None
-    if indexed_ids is not None and indexed_ids != eligible_ids:
-        try:
-            conn.execute(
-                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-            )
-            _purge_ineligible_fts_rows(conn)
-            _commit_if_owned(conn, had_txn)
-            return True
-        except sqlite3.Error:
-            return False
-
-    try:
-        conn.execute(
-            "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')"
-        )
-    except sqlite3.DatabaseError:
-        try:
-            conn.execute(
-                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-            )
-            _purge_ineligible_fts_rows(conn)
-            _commit_if_owned(conn, had_txn)
-            return True
-        except sqlite3.Error:
-            return False
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        _purge_ineligible_fts_rows(conn)
+        _commit_if_owned(conn, had_txn)
+        return True
     except sqlite3.Error:
         return False
-    return False
 
 
 # Individual complete statements, not one blob to be split on ";" -- each
@@ -1410,8 +1480,17 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
         # CLS: explicit type filter — caller wants only episodic or only semantic
         conditions.append("m.memory_type = ?")
         params.append(memory_type)
-    params.append(limit)
     where = " AND ".join(conditions)
+    # R8-B2 fix (Ari's independent REV8 audit, 2026-09-11): the primary
+    # query's borrow/scope/category/memory_type constraints -- especially
+    # the cross-agent borrow_from restriction to the source agent's
+    # scope='global' rows -- must also apply to any candidate-set expander
+    # (temporal neighborhood expansion, below) that pulls rows the primary
+    # query never vetted. Captured here, before `limit` is appended, so it
+    # can be reused as-is: same `where` string, same params in the same
+    # positional order, everywhere this search's constraints need to apply.
+    _search_where_params = list(params[1:])  # params[0] is fts_q, not part of `where`
+    params.append(limit)
 
     rows = db.execute(
         f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
@@ -1587,10 +1666,24 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                     # enforces indexed=1 eligibility. Temporal expansion must
                     # honor the same eligibility invariant as ordinary search --
                     # a row bypassing FTS isn't "found nearby," it's leaked.
-                    "SELECT * FROM memories WHERE retired_at IS NULL AND indexed = 1 "
-                    "AND created_at BETWEEN ? AND ? "
-                    "AND id NOT IN ({}) LIMIT 5".format(",".join("?" * len(seen_ids))),
-                    [lo, hi] + list(seen_ids),
+                    #
+                    # R8-B2 fix (Ari's independent REV8 audit, 2026-09-11): the
+                    # indexed=1 fix alone wasn't enough -- the primary query's
+                    # cross-agent borrow/scope/category/memory_type constraints
+                    # (in particular, borrow_from restricting a reader to the
+                    # source agent's scope='global' rows) were never applied to
+                    # this expander either, so a global-only cross-agent borrow
+                    # could pull back another agent's private nearby memory that
+                    # the primary query itself would never have returned. Reuse
+                    # the SAME `where`/`_search_where_params` the primary query
+                    # already built (aliased as `m` to match) rather than
+                    # maintaining a second, independently-drifting filter list --
+                    # this is the actual invariant: an expander must never see
+                    # more than the search it's expanding.
+                    f"SELECT m.* FROM memories m WHERE {where} "
+                    "AND m.created_at BETWEEN ? AND ? "
+                    "AND m.id NOT IN ({}) LIMIT 5".format(",".join("?" * len(seen_ids))),
+                    _search_where_params + [lo, hi] + list(seen_ids),
                 ).fetchall()
                 for nb in rows_to_list(nb_rows):
                     if nb["id"] not in seen_ids:

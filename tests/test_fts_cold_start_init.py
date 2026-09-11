@@ -148,15 +148,29 @@ def test_ensure_consistent_rebuilds_underpopulated_index(tmp_path):
     assert post == 1
 
 
-def test_ensure_consistent_no_rebuild_when_fully_indexed(tmp_path):
-    """When docsize already matches the active count and the index is
-    healthy, the helper is a no-op (guards against needless rebuilds)."""
+def test_ensure_consistent_rebuilds_even_when_already_indexed(tmp_path):
+    """R8-B1 fix (Ari's independent REV8 audit, 2026-09-11): this used to
+    assert the helper is a no-op when docsize already matches the active
+    count and structural integrity-check passes. That id-SET/integrity-only
+    view is exactly what let a same-id STALE-CONTENT restore go permanently
+    unrepaired -- id membership can look perfectly healthy while the actual
+    indexed text is wrong, and neither check catches that. The function now
+    always rebuilds when it runs at all (see its own docstring for the full
+    reasoning) -- a real behavior change, not a bug, and this function is
+    itself only reached rarely, gated by _cold_start_check_once's own TTL/
+    fingerprint bookkeeping, so the "needless rebuild" cost this test used
+    to guard against isn't the relevant risk anymore. The content stays
+    correct either way; verify that instead of the no-op return value."""
     db_path = tmp_path / "brain.db"
     conn = _seed_unindexed(db_path)
     conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
     conn.commit()
 
-    assert mcp_server._ensure_fts_index_consistent(conn) is False
+    assert mcp_server._ensure_fts_index_consistent(conn) is True
+    post = conn.execute(
+        "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'kelly'"
+    ).fetchone()[0]
+    assert post == 1, "the already-correct content must still be findable after the rebuild"
 
 
 def test_migration_084_rebuilds_unindexed_db(tmp_path):

@@ -126,7 +126,14 @@ def test_helper_rebuilds_on_database_error(tmp_path):
     assert any("'rebuild'" in s for s in rebuilt_calls)
 
 
-def test_no_rebuild_when_memories_empty(tmp_path):
+def test_rebuild_runs_even_when_memories_empty(tmp_path):
+    """R8-B1 fix (Ari's independent REV8 audit, 2026-09-11): this used to
+    assert a no-op when the memories table exists but is empty. The
+    function now always rebuilds whenever it's actually invoked (schema
+    initialized) -- see its own docstring for why an id-set/integrity-only
+    no-op path can't guarantee content freshness. An empty table is a
+    valid, cheap case to rebuild against (rebuild of nothing is fast), not
+    a case worth special-casing back into a no-op."""
     db_path = tmp_path / "brain.db"
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -144,7 +151,7 @@ def test_no_rebuild_when_memories_empty(tmp_path):
         """
     )
     rebuilt = mcp_server._ensure_fts_index_consistent(conn)
-    assert rebuilt is False
+    assert rebuilt is True
 
 
 def test_helper_tolerates_missing_table(tmp_path):
