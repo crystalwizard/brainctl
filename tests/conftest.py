@@ -88,7 +88,22 @@ def _reset_db_path_lock():
     flag's state, force it back to False so one test can never leave it
     leaked True (silently disabling another test's intended env-var
     isolation) or leaked False (silently exposing another test's patched
-    DB_PATH to ambient env-var clobbering)."""
+    DB_PATH to ambient env-var clobbering).
+
+    R7-B3 fix (Ari's independent REV7 audit, 2026-09-11): resetting
+    _DB_PATH_LOCKED alone isn't enough. get_db() also mutates
+    _DB_PATH_DEFAULT itself whenever it re-derives DB_PATH from the
+    environment while unlocked (the R5-B2 fix). A test that calls get_db()
+    through a real environment-only change -- exactly the natural pattern
+    the R5-B2 regression test uses -- advances that module-level sentinel
+    and leaves it advanced after the test ends, monkeypatch's own
+    setattr/setenv undo notwithstanding, since the mutation happens via
+    plain attribute assignment inside get_db(), not through monkeypatch.
+    A later test then sees DB_PATH != the *original* _DB_PATH_DEFAULT even
+    though nothing about it looks patched, and get_db()'s own
+    "DB_PATH == _DB_PATH_DEFAULT means nobody's explicitly pinned this"
+    check misfires. Snapshot and restore DB_PATH and _DB_PATH_DEFAULT here
+    too, the same defensive both-sides-of-yield shape as the lock flag."""
     def _set_all(value):
         for mod_name in _DB_PATH_LOCK_MODULES:
             try:
@@ -98,9 +113,28 @@ def _reset_db_path_lock():
             if hasattr(mod, "_DB_PATH_LOCKED"):
                 mod._DB_PATH_LOCKED = value
 
+    saved_paths = {}
+    for mod_name in _DB_PATH_LOCK_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        saved_paths[mod_name] = {
+            "DB_PATH": getattr(mod, "DB_PATH", None),
+            "_DB_PATH_DEFAULT": getattr(mod, "_DB_PATH_DEFAULT", None),
+        }
+
     _set_all(False)
     yield
     _set_all(False)
+    for mod_name, snapshot in saved_paths.items():
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        except Exception:
+            continue
+        for attr, value in snapshot.items():
+            if value is not None:
+                setattr(mod, attr, value)
 
 
 @pytest.fixture

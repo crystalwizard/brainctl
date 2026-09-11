@@ -434,18 +434,31 @@ def _cold_start_check_once(conn, db_path) -> bool:
     wiped/underpopulated FTS index (the exact scenario R5-B1 and R3-B1 exist
     for) could return zero results for real, eligible content for up to
     _FTS_REBUILD_CHECK_TTL_SECONDS, with no signal to the caller that
-    anything is wrong. A plain COUNT(*) comparison between eligible memories
-    and indexed FTS docs is cheap (index-backed on both sides) and, unlike
-    the full id-set comparison in _ensure_fts_index_consistent, worth running
-    on every single call regardless of the stamp/TTL bookkeeping -- it
-    catches exactly the severe, common case (a restore with the wrong
-    membership SIZE) immediately rather than eventually. The subtler
-    same-count-wrong-membership case (B4's original finding) doesn't need
-    instant detection the same way and stays TTL-bounded via the stamp.
+    anything is wrong. A cheap per-call fingerprint comparison between
+    eligible memories and indexed FTS docs, run on every call regardless of
+    the stamp/TTL bookkeeping, catches the severe, common restore case
+    immediately rather than eventually.
+
+    R7-B1 fix (Ari's independent REV7 audit, 2026-09-11): a plain COUNT(*)
+    comparison is not that fingerprint -- it only catches a SIZE mismatch.
+    Ari proved a same-stamp restore whose replacement content happens to
+    leave eligible and indexed COUNTS equal (wrong membership, right size)
+    sails through untouched and stays silently wrong for the full TTL
+    window. Comparing (COUNT, SUM(id)) instead of COUNT alone is still one
+    cheap index-backed aggregate query per side -- no real cost increase --
+    but two different id sets landing on both the same count AND the same
+    sum is a materially harder coincidence than matching count alone. This
+    is a strengthened cheap proxy for the real invariant, not a claim of
+    exact equivalence to the full id-set comparison in
+    _ensure_fts_index_consistent -- Ari's own wording ("do not replace the
+    full invariant with a count-only subcase") is honored by making the
+    per-call shortcut harder to fool, not by pretending it's the full check.
+    The full id-set comparison remains the authority whenever this
+    fingerprint actually mismatches or the TTL genuinely expires.
 
     Returns True if a check+possible-repair actually ran this call, False if
-    counts matched and this exact (path, instance) was checked within the
-    last _FTS_REBUILD_CHECK_TTL_SECONDS.
+    the fingerprint matched and this exact (path, instance) was checked
+    within the last _FTS_REBUILD_CHECK_TTL_SECONDS.
     """
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
@@ -458,13 +471,17 @@ def _cold_start_check_once(conn, db_path) -> bool:
             db_key = str(db_path)
 
     try:
-        eligible_count = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE retired_at IS NULL AND indexed = 1"
-        ).fetchone()[0]
-        indexed_count = conn.execute(
-            "SELECT COUNT(*) FROM memories_fts_docsize"
-        ).fetchone()[0]
-        counts_mismatched = eligible_count != indexed_count
+        # R7-B1: (COUNT, SUM(id)) fingerprint, not COUNT alone -- see the
+        # docstring above. COALESCE guards the empty-set case, where SUM is
+        # NULL rather than 0 and would otherwise compare unequal to itself.
+        eligible_fp = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM memories "
+            "WHERE retired_at IS NULL AND indexed = 1"
+        ).fetchone()
+        indexed_fp = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(rowid), 0) FROM memories_fts_docsize"
+        ).fetchone()
+        counts_mismatched = eligible_fp != indexed_fp
     except sqlite3.Error:
         counts_mismatched = False  # schema not initialized -- let the normal path's own try/except handle it
 
@@ -1562,7 +1579,15 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                 lo = (datetime.fromisoformat(created) - _th(hours=temporal_expand_hours)).strftime("%Y-%m-%dT%H:%M:%S")
                 hi = (datetime.fromisoformat(created) + _th(hours=temporal_expand_hours)).strftime("%Y-%m-%dT%H:%M:%S")
                 nb_rows = db.execute(
-                    "SELECT * FROM memories WHERE retired_at IS NULL "
+                    # R7-B2 fix (Ari's independent REV7 audit, 2026-09-11): this
+                    # query filtered retirement/time/id but not `indexed = 1`, so
+                    # a construct-only row that never entered FTS (e.g. still
+                    # mid-write, or left ineligible by a prior partial rebuild)
+                    # could be surfaced here even though the primary query above
+                    # enforces indexed=1 eligibility. Temporal expansion must
+                    # honor the same eligibility invariant as ordinary search --
+                    # a row bypassing FTS isn't "found nearby," it's leaked.
+                    "SELECT * FROM memories WHERE retired_at IS NULL AND indexed = 1 "
                     "AND created_at BETWEEN ? AND ? "
                     "AND id NOT IN ({}) LIMIT 5".format(",".join("?" * len(seen_ids))),
                     [lo, hi] + list(seen_ids),
