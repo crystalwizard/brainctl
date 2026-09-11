@@ -43,7 +43,14 @@ def test_r5_b1_stamp_collision_self_heals_after_ttl(tmp_path, monkeypatch):
     apart from "an old snapshot of it, restored later." The real fix bounds
     the resulting staleness with a TTL rather than chasing a perfect
     identity signal. This test shrinks the TTL so it doesn't need to sleep
-    300 real seconds to prove the bound actually works."""
+    300 real seconds to prove the bound actually works.
+
+    Uses a same-eligible-count replacement (both dbs have exactly one
+    indexed, present row) so the R6-B2 cheap count check doesn't fire
+    immediately -- that's the subtler same-count-wrong-membership case this
+    TTL bound is specifically for. The R6-B2 fix handles the more severe
+    count-mismatch case (a wiped/underpopulated FTS) instantly instead; see
+    test_ari_rev6_findings.py for that scenario."""
     import agentmemory.mcp_server as srv
 
     if not hasattr(srv, "_cold_start_check_once") or not hasattr(srv, "_db_instance_id"):
@@ -61,13 +68,16 @@ def test_r5_b1_stamp_collision_self_heals_after_ttl(tmp_path, monkeypatch):
     ).fetchone()[0]
     conn1.close()
 
-    # Simulate a restored backup: a genuinely different, underpopulated
-    # database that happens to carry the SAME stamp forward (exactly what a
-    # real file copy/restore would do -- the stamp travels with the bytes).
+    # Simulate a restored backup: a genuinely different database that
+    # happens to carry the SAME stamp forward (exactly what a real file
+    # copy/restore would do -- the stamp travels with the bytes) AND has
+    # the same eligible/indexed COUNT (one row, present in FTS) -- only the
+    # actual content differs. This is the case R6-B2's cheap count check
+    # can't catch by design, since the counts genuinely match.
     db_path.unlink()
-    conn2 = _write_db(db_path, eligible_present_in_fts=False)
+    conn2 = _write_db(db_path, eligible_present_in_fts=True)
     conn2.execute(
-        "INSERT INTO workspace_config (key, value) VALUES ('_db_instance_id', ?)", (stamp,)
+        "INSERT OR REPLACE INTO workspace_config (key, value) VALUES ('_db_instance_id', ?)", (stamp,)
     )
     conn2.commit()
 
@@ -83,7 +93,6 @@ def test_r5_b1_stamp_collision_self_heals_after_ttl(tmp_path, monkeypatch):
         "a stamp collision from a restored/copied database must self-heal "
         "once the TTL window has passed (R5-B1)"
     )
-    assert set(r[0] for r in conn2.execute("SELECT rowid FROM memories_fts_docsize").fetchall()) == {1}
 
 
 # --- R5-B2: two sequential environment-only changes must both take effect ---

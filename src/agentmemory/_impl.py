@@ -952,9 +952,12 @@ def get_db() -> sqlite3.Connection:
     # -- see mcp_server.py's get_db() for the full explanation. Without this,
     # a second legitimate environment-only change in the same process (e.g.
     # BRAIN_DB=A then later BRAIN_DB=B) is silently ignored.
-    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT and (
-        os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
-    ):
+    # R6-B1 fix: dropped the "(env vars present)" requirement -- see
+    # mcp_server.py's get_db() for the full explanation. scheduler.py's real
+    # pattern (temporarily set BRAIN_DB, call get_db(), remove it in a
+    # finally block) needs the REMOVAL to also trigger re-derivation back to
+    # the ambient default, which the presence check prevented.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT:
         DB_PATH = get_db_path()
         _DB_PATH_DEFAULT = DB_PATH
         BLOBS_DIR = get_blobs_dir()

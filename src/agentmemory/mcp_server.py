@@ -312,9 +312,21 @@ def get_db() -> sqlite3.Connection:
     # did. Moving the default forward in lockstep with real re-derivations
     # keeps that chain alive, while an external monkeypatch.setattr (which
     # never goes through this line) still breaks it and stays protected.
-    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT and (
-        os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
-    ):
+    # R6-B1 fix (Ari's independent REV6 audit, 2026-09-10): gating
+    # re-derivation behind "one of these three vars is CURRENTLY set" broke
+    # the reverse transition -- scheduler.py's real pattern is to temporarily
+    # set BRAIN_DB, call get_db(), then REMOVE it in a finally block,
+    # expecting the next call to fall back to the ambient default. With the
+    # env-presence check, removing the var meant the gate's "(env vars)"
+    # clause went False too, so DB_PATH stayed pinned to the temporary path
+    # forever. get_db_path() already correctly computes the right path
+    # whether or not any of these vars are set (falling back to the real
+    # default), so the presence check was never actually protecting
+    # anything -- dropping it and relying solely on the DB_PATH==default
+    # check (which already distinguishes "nobody's pinned this" from "an
+    # explicit patch happened") is what makes both directions -- var set,
+    # and var removed -- re-derive correctly.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT:
         DB_PATH = get_db_path()
         _DB_PATH_DEFAULT = DB_PATH
 
@@ -417,9 +429,23 @@ def _cold_start_check_once(conn, db_path) -> bool:
     bounds the resulting staleness: even a stamp collision self-heals within
     that window instead of being trusted forever.
 
+    R6-B2 fix (Ari's independent REV6 audit, 2026-09-10): a bounded staleness
+    window is still a silent correctness gap -- a database restored with a
+    wiped/underpopulated FTS index (the exact scenario R5-B1 and R3-B1 exist
+    for) could return zero results for real, eligible content for up to
+    _FTS_REBUILD_CHECK_TTL_SECONDS, with no signal to the caller that
+    anything is wrong. A plain COUNT(*) comparison between eligible memories
+    and indexed FTS docs is cheap (index-backed on both sides) and, unlike
+    the full id-set comparison in _ensure_fts_index_consistent, worth running
+    on every single call regardless of the stamp/TTL bookkeeping -- it
+    catches exactly the severe, common case (a restore with the wrong
+    membership SIZE) immediately rather than eventually. The subtler
+    same-count-wrong-membership case (B4's original finding) doesn't need
+    instant detection the same way and stays TTL-bounded via the stamp.
+
     Returns True if a check+possible-repair actually ran this call, False if
-    this exact (path, instance) was checked within the last
-    _FTS_REBUILD_CHECK_TTL_SECONDS.
+    counts matched and this exact (path, instance) was checked within the
+    last _FTS_REBUILD_CHECK_TTL_SECONDS.
     """
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
@@ -430,10 +456,23 @@ def _cold_start_check_once(conn, db_path) -> bool:
             db_key = f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
         except OSError:
             db_key = str(db_path)
+
+    try:
+        eligible_count = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE retired_at IS NULL AND indexed = 1"
+        ).fetchone()[0]
+        indexed_count = conn.execute(
+            "SELECT COUNT(*) FROM memories_fts_docsize"
+        ).fetchone()[0]
+        counts_mismatched = eligible_count != indexed_count
+    except sqlite3.Error:
+        counts_mismatched = False  # schema not initialized -- let the normal path's own try/except handle it
+
     now = time.monotonic()
-    last_checked = _FTS_REBUILD_CHECKED_PATHS.get(db_key)
-    if last_checked is not None and (now - last_checked) < _FTS_REBUILD_CHECK_TTL_SECONDS:
-        return False
+    if not counts_mismatched:
+        last_checked = _FTS_REBUILD_CHECKED_PATHS.get(db_key)
+        if last_checked is not None and (now - last_checked) < _FTS_REBUILD_CHECK_TTL_SECONDS:
+            return False
     _ensure_fts_index_consistent(conn)
     _FTS_REBUILD_CHECKED_PATHS[db_key] = now
     return True
