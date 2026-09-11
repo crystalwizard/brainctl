@@ -22,6 +22,7 @@ import struct
 import sys
 import urllib.request
 import urllib.error
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -237,6 +238,17 @@ DB_PATH = get_db_path()
 # brain-db-contamination-inventory-2026-07-13.md for the full incident.
 _DB_PATH_LOCKED = False
 
+# R3-B3 fix (Ari's independent REV3 audit, 2026-09-10): _DB_PATH_LOCKED only
+# helps a test that remembers to set it -- every pre-existing test that
+# patches DB_PATH directly (the exact pattern that caused the original
+# contamination) got no protection at all. Snapshotting the as-imported value
+# here makes protection automatic: get_db() below only re-derives from env
+# vars when DB_PATH still equals this default, i.e. nobody has explicitly
+# pinned it yet. A direct `monkeypatch.setattr(module, "DB_PATH", ...)` -- no
+# lock flag required -- makes DB_PATH != _DB_PATH_DEFAULT and is therefore
+# self-protecting.
+_DB_PATH_DEFAULT = DB_PATH
+
 
 def _find_vec_dylib():
     """Auto-discover the sqlite-vec loadable extension path."""
@@ -288,7 +300,9 @@ def get_db() -> sqlite3.Connection:
     # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
     # gate must also recognize BRAINCTL_DB, the canonical go-forward name
     # get_db_path() itself already checks first.
-    if not _DB_PATH_LOCKED and (
+    # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
+    # constant's definition above for why.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT and (
         os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
     ):
         DB_PATH = get_db_path()
@@ -319,32 +333,70 @@ def get_db() -> sqlite3.Connection:
 _FTS_REBUILD_CHECKED_PATHS: set = set()
 
 
-def _cold_start_check_once(conn, db_path) -> bool:
-    """Run _ensure_fts_index_consistent at most once per (path, file state)
-    per process. Pulled out of memory_search's body into its own callable
-    unit (2026-09-10) specifically so it can be unit tested directly --
-    Ari's REV2 review caught that the original F7 test never touched this
-    real guard at all, only a throwaway local set built for the test itself.
+def _db_instance_id(conn) -> str | None:
+    """R3-B1 fix (Ari's independent REV3 audit, 2026-09-10): mtime+size is not
+    a database identity -- confirmed by direct measurement to collide on a
+    same-size replacement landing in the same filesystem mtime-granularity
+    bucket, and independently reproduced by Ari with a controlled same-size,
+    restored-timestamp replacement. Neither mtime, size, nor inode (Windows
+    reuses freed inodes quickly) can be trusted.
 
-    R2-F3 fix included here: keying on path alone meant replacing the file
-    at the same path (a fresh/underpopulated db swapped in under the same
-    name) was silently skipped, since the path had already been marked
-    checked. Folding in mtime+size catches this in the overwhelming majority
-    of real replacements. Known residual gap, confirmed by direct
-    measurement (2026-09-10): a replacement that lands within the same mtime
-    granularity bucket (2s on this deployment's filesystem) AND produces a
-    byte-identical file size will still be treated as unchanged. This is a
-    narrow cold-start-guard limitation, not a reopening of the core FTS
-    corruption bug the rest of this file fixes.
-
-    Returns True if a check+possible-repair actually ran this call, False if
-    this exact (path, state) was already checked.
+    A value stamped INTO the database file itself, the first time this
+    process ever looks at it, has none of those problems: a genuinely new or
+    replaced file (created via connect()+executescript(), not a byte-for-byte
+    copy of the old one) simply won't have this row yet, so it gets a fresh
+    random id -- no coincidence in filesystem metadata can produce a
+    collision. `workspace_config` is an existing generic key-value table in
+    the schema, so this needs no migration. Returns None (never "no repair
+    needed") if the table doesn't exist yet (schema not initialized, or a
+    pre-workspace_config database) -- callers must treat that as "always
+    check," not as a stable identity of its own.
     """
     try:
-        _stat = os.stat(db_path)
-        db_key = f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
-    except OSError:
-        db_key = str(db_path)
+        row = conn.execute(
+            "SELECT value FROM workspace_config WHERE key = '_db_instance_id'"
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        new_id = uuid.uuid4().hex
+        had_txn = getattr(conn, "in_transaction", False)
+        conn.execute(
+            "INSERT INTO workspace_config (key, value) VALUES ('_db_instance_id', ?)",
+            (new_id,),
+        )
+        _commit_if_owned(conn, had_txn)
+        return new_id
+    except sqlite3.Error:
+        return None
+
+
+def _cold_start_check_once(conn, db_path) -> bool:
+    """Run _ensure_fts_index_consistent at most once per (path, database
+    instance) per process. Pulled out of memory_search's body into its own
+    callable unit (2026-09-10) specifically so it can be unit tested directly
+    -- Ari's REV2 review caught that the original F7 test never touched this
+    real guard at all, only a throwaway local set built for the test itself.
+
+    R3-B1 fix: keys on the stamped `_db_instance_id` (see that function)
+    rather than filesystem metadata, so a same-path replacement is detected
+    regardless of mtime granularity or size collisions. Falls back to
+    mtime+size only when the database predates `workspace_config` or the
+    table read/write itself fails -- a narrower, honestly-labeled residual
+    gap than the old mtime+size-only scheme, and never silently treated as
+    "unchanged" for a database that *can* be stamped.
+
+    Returns True if a check+possible-repair actually ran this call, False if
+    this exact (path, instance) was already checked.
+    """
+    instance_id = _db_instance_id(conn)
+    if instance_id is not None:
+        db_key = f"{db_path}:instance:{instance_id}"
+    else:
+        try:
+            _stat = os.stat(db_path)
+            db_key = f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+        except OSError:
+            db_key = str(db_path)
     if db_key in _FTS_REBUILD_CHECKED_PATHS:
         return False
     _ensure_fts_index_consistent(conn)

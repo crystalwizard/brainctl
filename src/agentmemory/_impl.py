@@ -108,6 +108,17 @@ BACKUPS_DIR = get_backups_dir()
 # leakage otherwise). Real (non-test) callers never touch this flag.
 _DB_PATH_LOCKED = False
 
+# R3-B3 fix (Ari's independent REV3 audit, 2026-09-10): _DB_PATH_LOCKED only
+# helps a test that remembers to set it -- every pre-existing test that
+# patches DB_PATH directly (the exact pattern that caused the original
+# contamination) got no protection at all. Snapshotting the as-imported value
+# here makes protection automatic: get_db() below only re-derives from env
+# vars when DB_PATH still equals this default, i.e. nobody has explicitly
+# pinned it yet. A direct `monkeypatch.setattr(module, "DB_PATH", ...)` -- no
+# lock flag required -- makes DB_PATH != _DB_PATH_DEFAULT and is therefore
+# self-protecting.
+_DB_PATH_DEFAULT = DB_PATH
+
 
 # THE-65 contamination incident, 2026-07-13: deliberately a hardcoded literal,
 # not derived from get_db_path()/get_brain_home() (both of which read env
@@ -935,7 +946,9 @@ def get_db() -> sqlite3.Connection:
     # go-forward name), but this gate only checked whether BRAIN_DB/BRAINCTL_HOME
     # were set to decide whether to bother calling it -- a caller setting only
     # BRAINCTL_DB was silently ignored, since the gate never fired at all.
-    if not _DB_PATH_LOCKED and (
+    # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
+    # constant's definition above for why.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT and (
         os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
     ):
         DB_PATH = get_db_path()
@@ -3499,7 +3512,7 @@ def cmd_memory_search(args):
 
     if args.exact:
         rows = db.execute(
-            "SELECT * FROM memories WHERE retired_at IS NULL AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
+            "SELECT * FROM memories WHERE retired_at IS NULL AND indexed = 1 AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
             (f"%{query}%", limit * 5 if not no_recency else limit)
         ).fetchall()
         results = rows_to_list(rows)
@@ -10220,7 +10233,7 @@ def cmd_report(args):
 
     # --- Memories ---
     h2("Key Memories")
-    mem_sql = "SELECT id, category, content, confidence, created_at FROM memories WHERE retired_at IS NULL"
+    mem_sql = "SELECT id, category, content, confidence, created_at FROM memories WHERE retired_at IS NULL AND indexed = 1"
     mem_params = []
     if topic:
         mem_sql += " AND (content LIKE ? OR category LIKE ?)"
@@ -10420,7 +10433,7 @@ def _report_entity(db, name, lines, h2, h3, p, bullet, blank, limit):
     # Related memories (by name mention)
     related_mems = db.execute(
         "SELECT content, confidence, created_at FROM memories "
-        "WHERE retired_at IS NULL AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
+        "WHERE retired_at IS NULL AND indexed = 1 AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
         (f"%{ent['name']}%", limit)
     ).fetchall()
     if related_mems:

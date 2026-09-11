@@ -5,6 +5,7 @@ FINDINGS_REV1.md: F:\\GPT Codex\\reviews\\brainctl-fts-fix-2026-09-10\\FINDINGS_
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -370,11 +371,24 @@ def test_r2_f3_replacing_db_file_at_same_path_still_gets_checked(tmp_path):
     """The specific gap R2-F3 named: path alone as the cache key means
     swapping in a fresh, underpopulated database under the SAME filename
     was silently skipped because that path string was already marked
-    checked. Folding file mtime+size into the key must catch this. Same as
-    F7's test: new functionality, skips cleanly on a commit that predates it
-    rather than crashing."""
+    checked.
+
+    R3-B1 (Ari's independent REV3 audit): mtime+size is not a database
+    identity either. Confirmed by direct measurement: on this filesystem
+    mtime_ns only advances in 2-second jumps, and two databases built from
+    identical schema+row-count land on the exact same file size -- so a
+    same-path replacement landing in the same mtime bucket was silently
+    skipped regardless of any sleep gap. Ari reproduced this independently
+    with a controlled same-size, restored-timestamp replacement.
+
+    This test now proves the real fix (a UUID stamped into the database
+    itself via `workspace_config`, see `_db_instance_id`) under the harshest
+    version of that scenario: replace the file with NO delay at all, and
+    deliberately force identical mtime/size on both files with `os.utime`,
+    so a mtime+size-keyed cache would be guaranteed to collide. If the
+    instance-id mechanism is what's actually doing the work, none of that
+    forced collision should matter."""
     import agentmemory.mcp_server as srv
-    import time
 
     if not hasattr(srv, "_cold_start_check_once") or not hasattr(srv, "_FTS_REBUILD_CHECKED_PATHS"):
         pytest.skip("_cold_start_check_once/_FTS_REBUILD_CHECKED_PATHS don't exist on this commit -- new functionality")
@@ -402,17 +416,20 @@ def test_r2_f3_replacing_db_file_at_same_path_still_gets_checked(tmp_path):
 
     conn1 = _write_db(eligible_present_in_fts=True)
     assert srv._cold_start_check_once(conn1, db_path) is True  # first check of this exact file
+    stat1 = os.stat(db_path)
     conn1.close()
 
-    # Measured directly on this filesystem: mtime_ns advances in 2-second
-    # jumps (not 1s), and the two db files here land on the exact same size
-    # (identical schema + row count), so a 1.1s gap collides with the same
-    # mtime bucket ~40% of the time -- that's what was flaking, not "load".
-    # 2.5s reliably crosses a 2s granularity boundary.
-    time.sleep(2.5)
+    # No sleep, immediate replacement -- and forcibly pin the replacement's
+    # mtime/size to match the original exactly, so a mtime+size-keyed cache
+    # would treat this as the identical, already-checked file no matter what.
     db_path.unlink()
     conn2 = _write_db(eligible_present_in_fts=False)  # a genuinely different, underpopulated db, same filename
+    conn2.commit()
+    os.utime(db_path, ns=(stat1.st_mtime_ns, stat1.st_mtime_ns))
+    stat2 = os.stat(db_path)
+    assert stat1.st_size == stat2.st_size, "test setup requires a genuine same-size collision to be meaningful"
+    assert stat1.st_mtime_ns == stat2.st_mtime_ns, "os.utime should have forced an exact mtime collision"
 
     ran = srv._cold_start_check_once(conn2, db_path)
-    assert ran is True, "a real file replacement at the same path must not be skipped as already-checked (R2-F3)"
+    assert ran is True, "a real file replacement at the same path must not be skipped as already-checked (R2-F3/R3-B1), even with forced-identical mtime and size"
     assert set(r[0] for r in conn2.execute("SELECT rowid FROM memories_fts_docsize").fetchall()) == {1}
