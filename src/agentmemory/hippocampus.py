@@ -104,16 +104,21 @@ def get_db() -> sqlite3.Connection:
     Second, independent layer: refuse outright to open the real production
     path while running under pytest, via the shared guard in _impl.py.
     """
-    global DB_PATH
+    global DB_PATH, _DB_PATH_DEFAULT
     # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
     # gate must also recognize BRAINCTL_DB, the canonical go-forward name
     # get_db_path() itself already checks first.
     # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
     # constant's definition above for why.
+    # R5-B2 fix: move _DB_PATH_DEFAULT forward with every real re-derivation
+    # -- see mcp_server.py's get_db() for the full explanation. Without this,
+    # a second legitimate environment-only change in the same process (e.g.
+    # BRAIN_DB=A then later BRAIN_DB=B) is silently ignored.
     if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT and (
         os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
     ):
         DB_PATH = get_db_path()
+        _DB_PATH_DEFAULT = DB_PATH
 
     if "PYTEST_CURRENT_TEST" in os.environ:
         _refuse_if_production_path(DB_PATH)

@@ -20,6 +20,7 @@ import re
 import sqlite3
 import struct
 import sys
+import time
 import urllib.request
 import urllib.error
 import uuid
@@ -296,16 +297,26 @@ _now_ts = now_iso
 
 
 def get_db() -> sqlite3.Connection:
-    global DB_PATH
+    global DB_PATH, _DB_PATH_DEFAULT
     # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
     # gate must also recognize BRAINCTL_DB, the canonical go-forward name
     # get_db_path() itself already checks first.
     # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
     # constant's definition above for why.
+    # R5-B2 fix (Ari's independent REV5 audit, 2026-09-10): _DB_PATH_DEFAULT
+    # must move forward every time re-derivation actually happens, or a
+    # SECOND legitimate environment-only change (BRAIN_DB=A, then later
+    # BRAIN_DB=B, same process) gets silently ignored -- DB_PATH is now A,
+    # which no longer equals the original import-time default, so the gate
+    # looks identical to "someone explicitly pinned it" even though nobody
+    # did. Moving the default forward in lockstep with real re-derivations
+    # keeps that chain alive, while an external monkeypatch.setattr (which
+    # never goes through this line) still breaks it and stays protected.
     if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT and (
         os.environ.get("BRAINCTL_DB") or os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")
     ):
         DB_PATH = get_db_path()
+        _DB_PATH_DEFAULT = DB_PATH
 
     if "PYTEST_CURRENT_TEST" in os.environ:
         _refuse_if_production_path(DB_PATH)
@@ -330,7 +341,21 @@ def get_db() -> sqlite3.Connection:
 # in a process permanently skipped the check for every other database opened
 # afterward in the same process. Keyed by resolved db path instead, so each
 # distinct database gets its own one-time check.
-_FTS_REBUILD_CHECKED_PATHS: set = set()
+#
+# R5-B1 fix (Ari's independent REV5 audit, 2026-09-10): "once per instance,
+# forever" is unfixable in principle for this key, because a restored backup
+# or a cloned file is BY DEFINITION carrying forward the same stamp as
+# whatever was true when it was last checked -- no passive signal (stamped
+# UUID included) can distinguish "still the same live database" from "an old
+# snapshot of it, restored later," since those really are byte-identical.
+# Ari proved this directly: stamp+cache a disposable db, then place a second,
+# genuinely different db carrying that same stamp at the same path -- a real
+# tool_memory_search still skipped repair. Bounding the cache with a TTL
+# caps the worst-case staleness window instead of chasing a perfect identity
+# signal that can't exist. Values are time.monotonic() timestamps of the last
+# check, not booleans -- `.clear()` still works the same for existing tests.
+_FTS_REBUILD_CHECKED_PATHS: dict = {}
+_FTS_REBUILD_CHECK_TTL_SECONDS = 300
 
 
 def _db_instance_id(conn) -> str | None:
@@ -372,7 +397,7 @@ def _db_instance_id(conn) -> str | None:
 
 def _cold_start_check_once(conn, db_path) -> bool:
     """Run _ensure_fts_index_consistent at most once per (path, database
-    instance) per process. Pulled out of memory_search's body into its own
+    instance) per TTL window. Pulled out of memory_search's body into its own
     callable unit (2026-09-10) specifically so it can be unit tested directly
     -- Ari's REV2 review caught that the original F7 test never touched this
     real guard at all, only a throwaway local set built for the test itself.
@@ -385,8 +410,16 @@ def _cold_start_check_once(conn, db_path) -> bool:
     gap than the old mtime+size-only scheme, and never silently treated as
     "unchanged" for a database that *can* be stamped.
 
+    R5-B1 fix: the stamp alone isn't enough -- a restored backup or cloned
+    file carries the SAME stamp forward, since it's the same bytes. No
+    passive signal can tell "still the same live database" apart from "an
+    old snapshot of it, restored later." _FTS_REBUILD_CHECK_TTL_SECONDS
+    bounds the resulting staleness: even a stamp collision self-heals within
+    that window instead of being trusted forever.
+
     Returns True if a check+possible-repair actually ran this call, False if
-    this exact (path, instance) was already checked.
+    this exact (path, instance) was checked within the last
+    _FTS_REBUILD_CHECK_TTL_SECONDS.
     """
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
@@ -397,10 +430,12 @@ def _cold_start_check_once(conn, db_path) -> bool:
             db_key = f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
         except OSError:
             db_key = str(db_path)
-    if db_key in _FTS_REBUILD_CHECKED_PATHS:
+    now = time.monotonic()
+    last_checked = _FTS_REBUILD_CHECKED_PATHS.get(db_key)
+    if last_checked is not None and (now - last_checked) < _FTS_REBUILD_CHECK_TTL_SECONDS:
         return False
     _ensure_fts_index_consistent(conn)
-    _FTS_REBUILD_CHECKED_PATHS.add(db_key)
+    _FTS_REBUILD_CHECKED_PATHS[db_key] = now
     return True
 
 
