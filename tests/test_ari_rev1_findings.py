@@ -404,7 +404,12 @@ def test_r2_f3_replacing_db_file_at_same_path_still_gets_checked(tmp_path):
     assert srv._cold_start_check_once(conn1, db_path) is True  # first check of this exact file
     conn1.close()
 
-    time.sleep(1.1)  # some filesystems only report mtime at ~1s granularity; 10ms was too tight and flaked
+    # Measured directly on this filesystem: mtime_ns advances in 2-second
+    # jumps (not 1s), and the two db files here land on the exact same size
+    # (identical schema + row count), so a 1.1s gap collides with the same
+    # mtime bucket ~40% of the time -- that's what was flaking, not "load".
+    # 2.5s reliably crosses a 2s granularity boundary.
+    time.sleep(2.5)
     db_path.unlink()
     conn2 = _write_db(eligible_present_in_fts=False)  # a genuinely different, underpopulated db, same filename
 

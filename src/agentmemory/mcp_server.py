@@ -329,9 +329,13 @@ def _cold_start_check_once(conn, db_path) -> bool:
     R2-F3 fix included here: keying on path alone meant replacing the file
     at the same path (a fresh/underpopulated db swapped in under the same
     name) was silently skipped, since the path had already been marked
-    checked. Folding in mtime+size means a real file replacement (which
-    changes at least one of those in virtually every real scenario) is
-    treated as a new identity needing its own check.
+    checked. Folding in mtime+size catches this in the overwhelming majority
+    of real replacements. Known residual gap, confirmed by direct
+    measurement (2026-09-10): a replacement that lands within the same mtime
+    granularity bucket (2s on this deployment's filesystem) AND produces a
+    byte-identical file size will still be treated as unchanged. This is a
+    narrow cold-start-guard limitation, not a reopening of the core FTS
+    corruption bug the rest of this file fixes.
 
     Returns True if a check+possible-repair actually ran this call, False if
     this exact (path, state) was already checked.
