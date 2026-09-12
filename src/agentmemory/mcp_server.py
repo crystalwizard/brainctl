@@ -542,10 +542,23 @@ def _cold_start_check_once(conn, db_path) -> bool:
     function exists to wire it into yet) -- documented here rather than
     silently assumed solved.
 
-    Returns True if a check+possible-repair actually ran this call, False
-    if the file wasn't touched, the fingerprint matched, and this exact
-    (path, instance) was checked within the last
-    _FTS_REBUILD_CHECK_TTL_SECONDS.
+    Returns True if a check+repair ran this call AND the repair actually
+    succeeded. Returns False in two different cases, deliberately not
+    distinguished by this boolean alone (see R9-B2 below): the file wasn't
+    touched, the fingerprint matched, and this exact (path, instance) was
+    checked within the last _FTS_REBUILD_CHECK_TTL_SECONDS (nothing needed
+    to run) -- OR a check did run but the repair itself failed.
+
+    R9-B2 fix (Ari's independent REV9 audit, 2026-09-11): this function
+    used to return True whenever a check ran, regardless of whether
+    _ensure_fts_index_consistent actually succeeded, and unconditionally
+    wrote a cache entry either way. Ari reproduced a real transient
+    failure (the rebuild's own INSERT denied at the SQLite authorizer
+    level) and showed the caller ignored that failure and cached it as a
+    successful, timestamped check anyway -- meaning the very next call,
+    for up to the full TTL window, trusted a repair that never happened.
+    A failed repair no longer writes a cache entry at all, so the next
+    call retries immediately rather than extending the failure's silence.
     """
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
@@ -589,9 +602,20 @@ def _cold_start_check_once(conn, db_path) -> bool:
             if not counts_mismatched:
                 return False
 
-    _ensure_fts_index_consistent(conn)
-    _FTS_REBUILD_CHECKED_PATHS[db_key] = (now, file_fp)
-    return True
+    # R9-B2 fix (Ari's independent REV9 audit, 2026-09-11): the return value
+    # used to be discarded here -- a FAILED repair (e.g. the authorizer
+    # denying the rebuild write, a real transient condition Ari reproduced
+    # directly) still got recorded as "checked just now," so the very next
+    # call trusted that phantom success and skipped retrying for the full
+    # TTL window, even though nothing was actually fixed. Only cache this
+    # (path, instance) as checked when the repair actually reports success --
+    # a failure leaves no cache entry, so the next call retries immediately
+    # instead of extending a failure's silence for up to
+    # _FTS_REBUILD_CHECK_TTL_SECONDS.
+    repaired = _ensure_fts_index_consistent(conn)
+    if repaired:
+        _FTS_REBUILD_CHECKED_PATHS[db_key] = (now, file_fp)
+    return repaired
 
 
 def _commit_if_owned(conn, had_txn: bool) -> None:
@@ -667,6 +691,106 @@ def _ensure_fts_index_consistent(conn) -> bool:
         return True
     except sqlite3.Error:
         return False
+
+
+def _fts_matches_real_content(fts_q: str, id_content_pairs) -> set:
+    """Build one small, disposable, in-memory FTS5 table (same tokenizer as
+    the real index: porter unicode61) from `id_content_pairs` and return
+    the ids whose REAL, current content actually satisfies `fts_q`. Uses
+    the real FTS5 engine, not a hand-rolled reimplementation of
+    tokenization -- a naive substring check would misfire on ordinary
+    stemming (a "running" query correctly matching content that says
+    "runs" is not staleness). Returns an empty set (fails closed to "no
+    real matches found") if verification itself can't run, e.g. `fts_q`
+    being empty."""
+    try:
+        verify_conn = sqlite3.connect(":memory:")
+        verify_conn.execute(
+            "CREATE VIRTUAL TABLE verify USING fts5(content, tokenize='porter unicode61')"
+        )
+        verify_conn.executemany(
+            "INSERT INTO verify(rowid, content) VALUES (?, ?)",
+            [(i, c or "") for i, c in id_content_pairs],
+        )
+        matched = {
+            row[0] for row in verify_conn.execute(
+                "SELECT rowid FROM verify WHERE verify MATCH ?", (fts_q,)
+            ).fetchall()
+        }
+        verify_conn.close()
+        return matched
+    except sqlite3.Error:
+        return set()
+
+
+def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None) -> list:
+    """R9-B1 fix (Ari's independent REV9 audit, 2026-09-11).
+
+    Every passive layer in this file (_db_instance_id's stamp,
+    _cold_start_check_once's TTL/fingerprint/file-touch bookkeeping) tries
+    to INFER whether a restore happened, so it knows when to bother
+    re-checking. Ari proved directly, twice now (REV8 and REV9), that
+    inference can't guarantee the FIRST real search after a restore is
+    correct -- there will always be a residual case (same ids, same
+    counts, same file mtime/size, stale content) no cheap passive signal
+    can see, because none of them actually look at content. The only way
+    to stop guessing is to check the actual claim a MATCH makes: that the
+    row's real, current content satisfies the query it supposedly
+    matched.
+
+    Two directions, two different costs:
+
+    **Non-empty results (the common case):** verify each already-fetched
+    candidate's real content against `fts_q` via `_fts_matches_real_content`
+    -- bounded by `limit`, no new database I/O, cheap. If every row
+    verifies, results are returned unchanged. If any row fails, that's
+    direct evidence the raw index is stale for this database, not just
+    for that one row (a partial index is the actual defect class this
+    whole branch addresses) -- forces an immediate full rebuild, bypassing
+    the TTL/fingerprint cache entirely since we now have positive evidence
+    rather than an inference, and re-runs the query once against the
+    freshly-rebuilt index.
+
+    **Empty results:** this is the harder direction Ari's REV9 exposed --
+    a stale index can produce a false NEGATIVE (real content exists, the
+    raw index just never learned about it) with nothing in an empty
+    result list to verify against. There is no way to catch this without
+    looking at content that isn't already in hand, so when `results` is
+    empty and `fetch_eligible_content` is supplied, this fetches every
+    eligible row's real (id, content) within the caller's own scope
+    constraints (same `where`, no MATCH/LIMIT) and checks whether `fts_q`
+    would genuinely match any of them. This is NOT bounded by `limit` --
+    it costs a full scan of the caller's eligible set, the same cost
+    class as the rebuild it may trigger. Deliberately paid only on the
+    empty-result branch (not every call) as the honest price of Ari's
+    explicit, repeated requirement that even a "no matches" answer be
+    correct, not just fast.
+
+    Either direction: if real content actually supports the query, force
+    a rebuild and retry once. `rerun` is a zero-arg callable that
+    re-executes the original query, supplied by the caller so this
+    function never reconstructs that SQL itself. Fails open (returns
+    `results` unchanged) if verification itself can't run.
+    """
+    if results:
+        real_ids = _fts_matches_real_content(fts_q, [(r["id"], r.get("content")) for r in results])
+        if real_ids >= {r["id"] for r in results}:
+            return results  # every row's real content actually satisfies the query
+    elif fetch_eligible_content is not None:
+        try:
+            eligible = fetch_eligible_content()
+        except sqlite3.Error:
+            return results
+        if not eligible:
+            return results  # genuinely nothing eligible to have matched
+        if not _fts_matches_real_content(fts_q, eligible):
+            return results  # real content confirms: genuinely no match, not staleness
+    else:
+        return results
+
+    _ensure_fts_index_consistent(db)
+    db.commit()
+    return rerun()
 
 
 # Individual complete statements, not one blob to be split on ";" -- each
@@ -1492,11 +1616,28 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     _search_where_params = list(params[1:])  # params[0] is fts_q, not part of `where`
     params.append(limit)
 
-    rows = db.execute(
-        f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
-        f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank LIMIT ?", params
-    ).fetchall()
-    results = rows_to_list(rows)
+    def _run_primary_query():
+        return rows_to_list(db.execute(
+            f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
+            f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank LIMIT ?", params
+        ).fetchall())
+
+    results = _run_primary_query()
+
+    def _fetch_eligible_content():
+        return db.execute(
+            f"SELECT m.id, m.content FROM memories m WHERE {where}", _search_where_params
+        ).fetchall()
+
+    # R9-B1 fix (Ari's independent REV9 audit, 2026-09-11): verify every
+    # returned row's real content actually satisfies the query it
+    # supposedly matched, and self-heal immediately if not -- see
+    # _verify_and_repair_stale_matches's own docstring for why this
+    # replaces trying to infer staleness in advance, and for the real,
+    # asymmetric cost of the empty-results branch. Runs unconditionally,
+    # including under benchmark=True -- correctness isn't the thing
+    # benchmark mode opts out of, reranking is.
+    results = _verify_and_repair_stale_matches(db, fts_q, results, _run_primary_query, _fetch_eligible_content)
 
     # CLS semantic bonus: when no type filter is set, apply a mild confidence
     # multiplier to semantic memories so they score slightly above equivalent

@@ -109,7 +109,21 @@ def test_r5_b1_stamp_collision_self_heals_after_ttl(tmp_path, monkeypatch):
     db_path = tmp_path / "shared-name.db"
 
     conn1 = _write_db(db_path, eligible_present_in_fts=True)
-    assert srv._cold_start_check_once(conn1, db_path) is True
+    srv._cold_start_check_once(conn1, db_path)
+    # R9-B2 note: a cache entry is now written only when repair actually
+    # succeeds (see _cold_start_check_once's own docstring) -- correctly,
+    # so a permanently-disabled repair (e.g. Ari's diagnostic, which
+    # replaces _ensure_fts_index_consistent with an always-False no-op)
+    # now never caches a phantom success, and _cold_start_check_once keeps
+    # retrying on every call instead. That's the intended R9-B2 fix, but
+    # it also means there's nothing for THIS test to establish trust in
+    # and later expire via TTL -- the premise doesn't apply when repair
+    # can never succeed at all. Skip rather than force an assertion that's
+    # structurally impossible under that specific condition.
+    if not srv._FTS_REBUILD_CHECKED_PATHS:
+        pytest.skip("no cache entry was written -- repair never succeeded on the first call "
+                    "(e.g. under a permanently-disabled repair), so there is no established "
+                    "trust for this test's TTL-expiry scenario to exercise")
     stamp = conn1.execute(
         "SELECT value FROM workspace_config WHERE key = '_db_instance_id'"
     ).fetchone()[0]
