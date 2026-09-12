@@ -723,7 +723,7 @@ def _fts_matches_real_content(fts_q: str, id_content_pairs) -> set:
         return set()
 
 
-def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None) -> list:
+def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None):
     """R9-B1 fix (Ari's independent REV9 audit, 2026-09-11).
 
     Every passive layer in this file (_db_instance_id's stamp,
@@ -771,26 +771,38 @@ def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch
     re-executes the original query, supplied by the caller so this
     function never reconstructs that SQL itself. Fails open (returns
     `results` unchanged) if verification itself can't run.
+
+    Returns `(results, repair_failed)`. `repair_failed` is True only when
+    real content proved a rebuild was actually needed AND that rebuild
+    itself then failed (e.g. denied at the SQLite authorizer level, the
+    exact case Ari reproduced for R9-B2) -- a real, self-audited finding:
+    the first version of this fix called _ensure_fts_index_consistent
+    here and discarded its return value, silently returning whatever
+    `rerun()` gave (still-stale results) with no signal anything was
+    wrong -- the identical class of bug R9-B2 fixes at the caching layer,
+    just reintroduced one call site over. The caller surfaces this rather
+    than silently reporting `ok: True` over data proven wrong in the same
+    breath that proved it.
     """
     if results:
         real_ids = _fts_matches_real_content(fts_q, [(r["id"], r.get("content")) for r in results])
         if real_ids >= {r["id"] for r in results}:
-            return results  # every row's real content actually satisfies the query
+            return results, False  # every row's real content actually satisfies the query
     elif fetch_eligible_content is not None:
         try:
             eligible = fetch_eligible_content()
         except sqlite3.Error:
-            return results
+            return results, False
         if not eligible:
-            return results  # genuinely nothing eligible to have matched
+            return results, False  # genuinely nothing eligible to have matched
         if not _fts_matches_real_content(fts_q, eligible):
-            return results  # real content confirms: genuinely no match, not staleness
+            return results, False  # real content confirms: genuinely no match, not staleness
     else:
-        return results
+        return results, False
 
-    _ensure_fts_index_consistent(db)
+    repaired = _ensure_fts_index_consistent(db)
     db.commit()
-    return rerun()
+    return rerun(), not repaired
 
 
 # Individual complete statements, not one blob to be split on ";" -- each
@@ -1637,7 +1649,9 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     # asymmetric cost of the empty-results branch. Runs unconditionally,
     # including under benchmark=True -- correctness isn't the thing
     # benchmark mode opts out of, reranking is.
-    results = _verify_and_repair_stale_matches(db, fts_q, results, _run_primary_query, _fetch_eligible_content)
+    results, _index_repair_failed = _verify_and_repair_stale_matches(
+        db, fts_q, results, _run_primary_query, _fetch_eligible_content
+    )
 
     # CLS semantic bonus: when no type filter is set, apply a mild confidence
     # multiplier to semantic memories so they score slightly above equivalent
@@ -1864,6 +1878,15 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
               "slot_cap": max_slots, "tier": tier}
     if borrow_from:
         result["borrowed_from"] = borrow_from
+    if _index_repair_failed:
+        # Self-audited addition, not part of Ari's original R9-B1 report:
+        # real content proved the raw FTS index needed a rebuild, and that
+        # rebuild itself then failed. Silently returning `ok: True` here
+        # (the first version of this fix did exactly that) would be the
+        # identical class of bug R9-B2 fixes at the caching layer, just
+        # reintroduced at this call site -- results below may be
+        # incomplete or stale despite `ok: True`.
+        result["index_repair_failed"] = True
     return result
 
 
