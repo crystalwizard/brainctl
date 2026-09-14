@@ -741,9 +741,28 @@ def _fts_matches_real_content(fts_q: str, id_field_rows) -> tuple:
             verify_conn.close()
 
 
-def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None):
+def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None, limit=None):
     """R9-B1 fix (Ari's independent REV9 audit, 2026-09-11), corrected by
-    R10-B1/R10-B2/R10-B3 (Ari's independent REV10 audit, 2026-09-14).
+    R10-B1/R10-B2/R10-B3 (Ari's independent REV10 audit, 2026-09-14), and
+    again by R11-B1 (Ari's independent REV11 audit, 2026-09-14, same day --
+    fast turnaround).
+
+    **R11-B1 fix, a real regression R10-B1 introduced:** comparing the full
+    real eligible match SET against the primary query's LIMITED result set
+    for exact equality is wrong whenever there are genuinely more matches
+    than requested slots -- ordinary bounded retrieval (more real matches
+    than `limit`) looks IDENTICAL to a set-equality check as the actual
+    defect class this whole mechanism exists to catch (some matches
+    silently missing). Ari measured this directly: a healthy index with 14
+    real matches and a 7-slot tier cap forced a full rebuild on every
+    single call, for perfectly correct behavior. The fix compares against
+    an EXPECTED count, not the raw eligible-set size: `min(limit,
+    len(real_ids))` -- the number of real matches that should have come
+    back given the bounded query contract. Combined with the existing
+    subset check (every returned id must actually be a real match), this
+    still catches genuine incompleteness (fewer returned than the bounded
+    contract promised, or a returned id that isn't real) while no longer
+    flagging ordinary truncation as staleness.
 
     Every passive layer in this file (_db_instance_id's stamp,
     _cold_start_check_once's TTL/fingerprint/file-touch bookkeeping) tries
@@ -824,6 +843,34 @@ def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch
     site over. `_ensure_fts_index_consistent` already commits correctly
     on its own when it owns the transaction; no second commit belongs
     here.
+
+    **R11-B2, deliberately NOT fixed here -- narrowed scope, not silence.**
+    Ari proved a restore can preserve the correct SET of matching ids while
+    scrambling their RELEVANCE ORDER (stale term-frequency/position data
+    changing which of two real matches should rank first), and this
+    function's membership-only check accepts that silently. I looked hard
+    at fixing this the same way as everything else here (build the
+    disposable verify table with `ORDER BY rank` and compare ordering) and
+    concluded it would be UNSOUND, not just harder: FTS5's default `rank`
+    (bm25) is computed from corpus-wide statistics -- average document
+    length, term document frequency -- across the ENTIRE `memories_fts`
+    virtual table, not the outer SQL query's WHERE-scoped subset. The
+    verify table this function builds only ever contains the current
+    query's ELIGIBLE rows (a small, scope-specific population), which
+    predictably has DIFFERENT corpus statistics than the real index
+    whenever that scope is a fraction of the whole table (borrow_from,
+    category filters, anything but a full unscoped search) -- so a rank
+    comparison against it would produce real false positives (legitimate
+    rank differences flagged as corruption, reintroducing R11-B1's
+    regression in a new shape) as readily as it would catch real ones.
+    Ari's own REV11 report offered this as a legitimate closure path:
+    "close it or explicitly narrow and agree the restore-correctness
+    contract" -- this is that: membership/completeness is verified and
+    guaranteed (R10-B1, R10-B2, R10-B3, R11-B1 above); relevance ORDER
+    after a restore is NOT verified by this mechanism, and claiming
+    otherwise would be the same class of overclaim this whole line of
+    fixes exists to stop making. Flagged to Kelly as a real product
+    decision, not decided unilaterally here.
     """
     returned_ids = {r["id"] for r in results}
 
@@ -835,8 +882,17 @@ def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch
         real_ids, verification_ok = _fts_matches_real_content(fts_q, eligible)
         if not verification_ok:
             return results, False, True
-        if real_ids == returned_ids:
-            return results, False, False  # every real match accounted for, nothing extra
+        # R11-B1 fix: expected count respects the bounded query contract --
+        # `limit` real matches at most, or however many real matches exist
+        # if fewer than `limit`. Comparing against the raw eligible-set
+        # size (the old `real_ids == returned_ids`) treated ordinary
+        # truncation as staleness; comparing against this expected count
+        # still catches genuine omission (fewer returned than the contract
+        # promised) and genuine false positives (a returned id that isn't
+        # real) without either regression.
+        expected_count = len(real_ids) if limit is None else min(limit, len(real_ids))
+        if returned_ids <= real_ids and len(returned_ids) >= expected_count:
+            return results, False, False  # bounded contract satisfied, nothing omitted or extra
     elif results:
         # No eligible-fetch supplied (defensive/back-compat path): the best
         # available check is validating the rows already in hand against
@@ -1711,8 +1767,10 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     # completeness rather than only on empty results. Runs
     # unconditionally, including under benchmark=True -- correctness
     # isn't the thing benchmark mode opts out of, reranking is.
+    # `limit` (already tier-capped above) is passed through so R11-B1's
+    # fix can tell ordinary bounded truncation apart from real omission.
     results, _index_repair_failed, _index_verification_failed = _verify_and_repair_stale_matches(
-        db, fts_q, results, _run_primary_query, _fetch_eligible_content
+        db, fts_q, results, _run_primary_query, _fetch_eligible_content, limit
     )
 
     # CLS semantic bonus: when no type filter is set, apply a mild confidence
