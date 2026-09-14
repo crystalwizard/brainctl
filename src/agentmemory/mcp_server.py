@@ -693,116 +693,168 @@ def _ensure_fts_index_consistent(conn) -> bool:
         return False
 
 
-def _fts_matches_real_content(fts_q: str, id_content_pairs) -> set:
-    """Build one small, disposable, in-memory FTS5 table (same tokenizer as
-    the real index: porter unicode61) from `id_content_pairs` and return
-    the ids whose REAL, current content actually satisfies `fts_q`. Uses
-    the real FTS5 engine, not a hand-rolled reimplementation of
-    tokenization -- a naive substring check would misfire on ordinary
-    stemming (a "running" query correctly matching content that says
-    "runs" is not staleness). Returns an empty set (fails closed to "no
-    real matches found") if verification itself can't run, e.g. `fts_q`
-    being empty."""
+def _fts_matches_real_content(fts_q: str, id_field_rows) -> tuple:
+    """Build one small, disposable, in-memory FTS5 table (same tokenizer AND
+    same three indexed columns as the real index: content, category, tags --
+    R10-B2 fix, Ari's independent REV10 audit, 2026-09-14. The real
+    `memories_fts` table indexes all three columns (see init_schema.sql);
+    the first version of this verifier only built/checked `content`, which
+    cut both ways -- a restored category-only or tag-only match silently
+    verified as "no real match" (false negative on top of the original
+    false negative this whole mechanism exists to catch), AND a perfectly
+    healthy category-only or tag-only hit looked like a mismatch against
+    this narrower check, triggering repeated unnecessary rebuilds on every
+    call for content that was never actually stale -- a real regression
+    Ari's REV10 caught, not present in REV9.
+
+    `id_field_rows` is (id, content, category, tags) tuples. Returns
+    `(matched_ids: set, verification_ok: bool)`. R10-B3 fix: verification
+    failure (the in-memory connection or a query on it raising) is no
+    longer silently collapsed into "genuinely no match" -- the first
+    version returned a bare empty set indistinguishable from a real
+    negative result, so a verifier fault on top of a stale index produced
+    `ok: True, count: 0` with no signal anything was wrong. Callers must
+    check `verification_ok` before trusting an empty `matched_ids` as a
+    real answer. The connection is closed in a `finally` block so a raised
+    exception doesn't leak it -- the prior version only closed on the
+    success path."""
+    verify_conn = None
     try:
         verify_conn = sqlite3.connect(":memory:")
         verify_conn.execute(
-            "CREATE VIRTUAL TABLE verify USING fts5(content, tokenize='porter unicode61')"
+            "CREATE VIRTUAL TABLE verify USING fts5(content, category, tags, tokenize='porter unicode61')"
         )
         verify_conn.executemany(
-            "INSERT INTO verify(rowid, content) VALUES (?, ?)",
-            [(i, c or "") for i, c in id_content_pairs],
+            "INSERT INTO verify(rowid, content, category, tags) VALUES (?, ?, ?, ?)",
+            [(i, c or "", cat or "", t or "") for i, c, cat, t in id_field_rows],
         )
         matched = {
             row[0] for row in verify_conn.execute(
                 "SELECT rowid FROM verify WHERE verify MATCH ?", (fts_q,)
             ).fetchall()
         }
-        verify_conn.close()
-        return matched
+        return matched, True
     except sqlite3.Error:
-        return set()
+        return set(), False
+    finally:
+        if verify_conn is not None:
+            verify_conn.close()
 
 
 def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None):
-    """R9-B1 fix (Ari's independent REV9 audit, 2026-09-11).
+    """R9-B1 fix (Ari's independent REV9 audit, 2026-09-11), corrected by
+    R10-B1/R10-B2/R10-B3 (Ari's independent REV10 audit, 2026-09-14).
 
     Every passive layer in this file (_db_instance_id's stamp,
     _cold_start_check_once's TTL/fingerprint/file-touch bookkeeping) tries
     to INFER whether a restore happened, so it knows when to bother
-    re-checking. Ari proved directly, twice now (REV8 and REV9), that
-    inference can't guarantee the FIRST real search after a restore is
-    correct -- there will always be a residual case (same ids, same
-    counts, same file mtime/size, stale content) no cheap passive signal
-    can see, because none of them actually look at content. The only way
-    to stop guessing is to check the actual claim a MATCH makes: that the
-    row's real, current content satisfies the query it supposedly
-    matched.
+    re-checking. Ari proved directly, three times now (REV8, REV9, REV10),
+    that inference can't guarantee a search is correct -- there will
+    always be a residual case no cheap passive signal can see, because
+    none of them actually look at content. The only way to stop guessing
+    is to check the actual claim a MATCH makes against every row that
+    could have made it.
 
-    Two directions, two different costs:
+    **R10-B1 correction, the actual behavior change from R9-B1's design:**
+    the original version only verified already-RETURNED rows when results
+    were non-empty, and only scanned the full eligible set when results
+    were completely empty. Ari proved that split is wrong: a restore can
+    leave one real match findable (correct posting) and a second real
+    match unfindable (stale posting) in the SAME query, so results come
+    back non-empty AND genuinely incomplete at once -- the old non-empty
+    branch verified the one row it had and declared victory, never
+    learning the second row existed. There is no cheap way to distinguish
+    "these results are non-empty and complete" from "these results are
+    non-empty and silently missing rows" without checking against the
+    real eligible set either way -- so this now ALWAYS fetches the
+    eligible set (when `fetch_eligible_content` is supplied) and compares
+    its real FTS-matched ids directly against what the primary query
+    returned, empty or not. This is a real, accepted cost increase (every
+    call now pays the eligible-scan cost previously paid only on empty
+    results) -- Ari's own words, repeated across two reviews: correctness
+    here is not negotiable against speed.
 
-    **Non-empty results (the common case):** verify each already-fetched
-    candidate's real content against `fts_q` via `_fts_matches_real_content`
-    -- bounded by `limit`, no new database I/O, cheap. If every row
-    verifies, results are returned unchanged. If any row fails, that's
-    direct evidence the raw index is stale for this database, not just
-    for that one row (a partial index is the actual defect class this
-    whole branch addresses) -- forces an immediate full rebuild, bypassing
-    the TTL/fingerprint cache entirely since we now have positive evidence
+    If the real match set (computed via `_fts_matches_real_content`,
+    which now checks the SAME three columns -- content, category, tags --
+    the real index actually indexes; see R10-B2 in that function's own
+    docstring) equals the set of ids the primary query returned, the
+    results are both valid and complete -- returned unchanged. Any
+    difference at all (missing rows, extra/stale rows, or both) is direct
+    evidence the raw index is inconsistent for this database, not just
+    for one row -- forces an immediate full rebuild, bypassing the
+    TTL/fingerprint cache entirely since this is now positive evidence
     rather than an inference, and re-runs the query once against the
     freshly-rebuilt index.
 
-    **Empty results:** this is the harder direction Ari's REV9 exposed --
-    a stale index can produce a false NEGATIVE (real content exists, the
-    raw index just never learned about it) with nothing in an empty
-    result list to verify against. There is no way to catch this without
-    looking at content that isn't already in hand, so when `results` is
-    empty and `fetch_eligible_content` is supplied, this fetches every
-    eligible row's real (id, content) within the caller's own scope
-    constraints (same `where`, no MATCH/LIMIT) and checks whether `fts_q`
-    would genuinely match any of them. This is NOT bounded by `limit` --
-    it costs a full scan of the caller's eligible set, the same cost
-    class as the rebuild it may trigger. Deliberately paid only on the
-    empty-result branch (not every call) as the honest price of Ari's
-    explicit, repeated requirement that even a "no matches" answer be
-    correct, not just fast.
+    **R10-B3 correction:** `_fts_matches_real_content` now distinguishes
+    "ran and found no real matches" from "could not run at all" via its
+    own `verification_ok` flag. The first version of this function (and
+    the version before that) collapsed a verifier failure into a bare
+    empty set indistinguishable from a genuine negative result -- exactly
+    the failure-injection case Ari reproduced (a denied verifier
+    connection landing on top of a stale index) would have silently
+    returned `ok: True, count: 0` with real matching content sitting
+    unreached and no signal anything was wrong. A failed verification (at
+    the eligible-fetch step or the FTS-check step) now returns results
+    unchanged with `verification_failed=True` rather than being treated
+    as proof of anything.
 
-    Either direction: if real content actually supports the query, force
-    a rebuild and retry once. `rerun` is a zero-arg callable that
-    re-executes the original query, supplied by the caller so this
-    function never reconstructs that SQL itself. Fails open (returns
-    `results` unchanged) if verification itself can't run.
+    `rerun` is a zero-arg callable that re-executes the original query,
+    supplied by the caller so this function never reconstructs that SQL
+    itself.
 
-    Returns `(results, repair_failed)`. `repair_failed` is True only when
-    real content proved a rebuild was actually needed AND that rebuild
-    itself then failed (e.g. denied at the SQLite authorizer level, the
-    exact case Ari reproduced for R9-B2) -- a real, self-audited finding:
-    the first version of this fix called _ensure_fts_index_consistent
-    here and discarded its return value, silently returning whatever
-    `rerun()` gave (still-stale results) with no signal anything was
-    wrong -- the identical class of bug R9-B2 fixes at the caching layer,
-    just reintroduced one call site over. The caller surfaces this rather
-    than silently reporting `ok: True` over data proven wrong in the same
-    breath that proved it.
+    Returns `(results, repair_failed, verification_failed)`.
+    `repair_failed` is True only when real content proved a rebuild was
+    actually needed AND that rebuild itself then failed (e.g. denied at
+    the SQLite authorizer level, the case Ari reproduced for R9-B2) -- the
+    caller surfaces this rather than silently reporting `ok: True` over
+    data proven wrong in the same breath that proved it.
+    `verification_failed` is True when correctness could not be
+    established at all this call (R10-B3) -- distinct from `repair_failed`
+    because no rebuild was ever attempted; there was nothing to compare
+    against.
+
+    R10 additional finding, also fixed here: the prior version called
+    `db.commit()` unconditionally after a repair, bypassing
+    `_ensure_fts_index_consistent`'s own `_commit_if_owned` transaction-
+    ownership tracking -- Ari demonstrated this finalizes whatever
+    unrelated work the CALLER already had pending in an open transaction,
+    not just this function's own changes, the identical class of bug
+    `_commit_if_owned` exists to prevent (R2-F1), reintroduced one call
+    site over. `_ensure_fts_index_consistent` already commits correctly
+    on its own when it owns the transaction; no second commit belongs
+    here.
     """
-    if results:
-        real_ids = _fts_matches_real_content(fts_q, [(r["id"], r.get("content")) for r in results])
-        if real_ids >= {r["id"] for r in results}:
-            return results, False  # every row's real content actually satisfies the query
-    elif fetch_eligible_content is not None:
+    returned_ids = {r["id"] for r in results}
+
+    if fetch_eligible_content is not None:
         try:
             eligible = fetch_eligible_content()
         except sqlite3.Error:
-            return results, False
-        if not eligible:
-            return results, False  # genuinely nothing eligible to have matched
-        if not _fts_matches_real_content(fts_q, eligible):
-            return results, False  # real content confirms: genuinely no match, not staleness
+            return results, False, True  # can't establish anything this call -- fail open, flagged
+        real_ids, verification_ok = _fts_matches_real_content(fts_q, eligible)
+        if not verification_ok:
+            return results, False, True
+        if real_ids == returned_ids:
+            return results, False, False  # every real match accounted for, nothing extra
+    elif results:
+        # No eligible-fetch supplied (defensive/back-compat path): the best
+        # available check is validating the rows already in hand against
+        # their own real content -- can't establish completeness without
+        # an eligible-set fetch, so a clean validation here is NOT the same
+        # guarantee as the branch above and never claims to be.
+        real_ids, verification_ok = _fts_matches_real_content(
+            fts_q, [(r["id"], r.get("content"), r.get("category"), r.get("tags")) for r in results]
+        )
+        if not verification_ok:
+            return results, False, True
+        if real_ids >= returned_ids:
+            return results, False, False
     else:
-        return results, False
+        return results, False, False  # nothing returned, no way to check for omissions
 
     repaired = _ensure_fts_index_consistent(db)
-    db.commit()
-    return rerun(), not repaired
+    return rerun(), not repaired, False
 
 
 # Individual complete statements, not one blob to be split on ";" -- each
@@ -1637,19 +1689,29 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     results = _run_primary_query()
 
     def _fetch_eligible_content():
+        # R10-B2 fix: category and tags are real, independently-indexed FTS
+        # columns (see memories_fts's schema) -- fetching content alone let
+        # a restored category-only or tag-only match verify as "no real
+        # match" (compounding the false negative this whole mechanism
+        # exists to catch) and let a healthy category-only or tag-only hit
+        # look like a mismatch against a content-only check, triggering
+        # rebuilds on perfectly good data. All three columns travel
+        # together everywhere this eligible set is used.
         return db.execute(
-            f"SELECT m.id, m.content FROM memories m WHERE {where}", _search_where_params
+            f"SELECT m.id, m.content, m.category, m.tags FROM memories m WHERE {where}", _search_where_params
         ).fetchall()
 
-    # R9-B1 fix (Ari's independent REV9 audit, 2026-09-11): verify every
-    # returned row's real content actually satisfies the query it
-    # supposedly matched, and self-heal immediately if not -- see
-    # _verify_and_repair_stale_matches's own docstring for why this
-    # replaces trying to infer staleness in advance, and for the real,
-    # asymmetric cost of the empty-results branch. Runs unconditionally,
-    # including under benchmark=True -- correctness isn't the thing
-    # benchmark mode opts out of, reranking is.
-    results, _index_repair_failed = _verify_and_repair_stale_matches(
+    # R9-B1 fix (Ari's independent REV9 audit, 2026-09-11), corrected by
+    # R10-B1/R10-B2/R10-B3 (Ari's independent REV10 audit, 2026-09-14):
+    # verify every returned row's real content actually satisfies the
+    # query it supposedly matched AND that no eligible row was silently
+    # omitted, self-heal immediately if not -- see
+    # _verify_and_repair_stale_matches's own docstring for the full
+    # reasoning and the real, accepted cost of always checking
+    # completeness rather than only on empty results. Runs
+    # unconditionally, including under benchmark=True -- correctness
+    # isn't the thing benchmark mode opts out of, reranking is.
+    results, _index_repair_failed, _index_verification_failed = _verify_and_repair_stale_matches(
         db, fts_q, results, _run_primary_query, _fetch_eligible_content
     )
 
@@ -1887,6 +1949,16 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
         # reintroduced at this call site -- results below may be
         # incomplete or stale despite `ok: True`.
         result["index_repair_failed"] = True
+    if _index_verification_failed:
+        # R10-B3 fix (Ari's independent REV10 audit, 2026-09-14): the
+        # eligible-content fetch or the real-content FTS check itself
+        # failed to run -- correctness of `results` below could not be
+        # established this call, distinct from a repair having been
+        # attempted and failed. Silently returning `ok: True` here would
+        # let a verifier fault (e.g. a denied in-memory connection)
+        # sitting on top of a genuinely stale index look identical to a
+        # clean, verified answer.
+        result["index_verification_failed"] = True
     return result
 
 
