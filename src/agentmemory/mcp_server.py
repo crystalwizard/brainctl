@@ -689,6 +689,27 @@ def _ensure_fts_index_consistent(conn) -> bool:
         _commit_if_owned(conn, had_txn)
         return True
     except sqlite3.Error:
+        # BW-B1 fix (Ari's independent REV15 backward adversarial audit,
+        # 2026-09-15): the rebuild step imports EVERY row in `memories`
+        # regardless of eligibility (see _purge_ineligible_fts_rows's own
+        # docstring), then the purge removes the ineligible ones -- if the
+        # rebuild succeeds but the purge itself then fails, this used to
+        # just return False with no cleanup, leaving the rebuild's raw FTS
+        # import (including ineligible rows) sitting uncommitted in
+        # whatever transaction this function opened. Ari's reproduction:
+        # a subsequent verification call sees that still-open transaction,
+        # correctly treats it as caller-owned (this function's own
+        # ownership rule), and ends up committing the partial, broken
+        # rebuild -- a real ineligible posting persisted through to
+        # production. Only roll back when THIS call opened the
+        # transaction (`not had_txn`, captured before any write above) --
+        # a transaction this function did not open is never finalized
+        # here, in either direction, same as everywhere else in this file.
+        if not had_txn:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         return False
 
 
@@ -1983,6 +2004,22 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     """
     if memory_type and memory_type not in ("episodic", "semantic", "procedural"):
         return {"ok": False, "error": "memory_type must be 'episodic', 'semantic', or 'procedural'"}
+
+    # BW-B2 fix (Ari's independent REV15 backward adversarial audit,
+    # 2026-09-15): SQLite treats a negative LIMIT as "no limit at all" --
+    # real, documented SQLite semantics, not a bug in the primary query.
+    # The R14-B2 fix (check the limit before appending a reference
+    # candidate) broke on this: for any negative limit, `0 >= limit` is
+    # true on the very first candidate, so the reference always came back
+    # empty regardless of how many real matches existed -- a guaranteed,
+    # permanent disagreement with production's real (unbounded) behavior,
+    # in the dangerous direction: a stale index needing repair could
+    # report `count: 0` with no flag while the true, rebuilt answer had
+    # real matches. Rejected outright here rather than propagated through
+    # to the reference/limit machinery at all, matching the existing
+    # `memory_type` validation pattern immediately above.
+    if limit < 0:
+        return {"ok": False, "error": "limit must be zero or a positive integer"}
 
     # Cross-agent borrow restricts the SQL to `scope='global'` (line ~846).
     # Combining that with an explicit non-global scope produces an
