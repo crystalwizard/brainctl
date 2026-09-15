@@ -667,7 +667,39 @@ def _ensure_fts_index_consistent(conn) -> bool:
     no longer needed as a distinct code path.
 
     Returns ``True`` if a rebuild was actually performed, ``False`` if
-    the schema isn't initialized (nothing to check or rebuild against).
+    the schema isn't initialized or the rebuild/purge failed but was
+    cleanly undone. Raises ``_FTSCleanupUnresolvedError`` (see that
+    class's own docstring) if even the undo itself could not be
+    completed -- callers must not treat that as an ordinary ``False``.
+
+    **BW-B1 fix (Ari's independent REV15/16 backward adversarial audit,
+    2026-09-15), a real redesign, not a patch:** the rebuild step imports
+    EVERY row in ``memories`` regardless of eligibility (see
+    ``_purge_ineligible_fts_rows``'s own docstring), then the purge
+    removes the ineligible ones. The first version only rolled back the
+    OUTER transaction, and only when this function itself had opened it
+    -- two real, independently reproduced gaps followed: (1) when the
+    caller already owned the transaction, this function correctly never
+    touched it (per this file's standing rule), but then had no way to
+    undo its OWN partial changes without also touching the caller's
+    unrelated pending work, so it just returned ``False`` and left the
+    partial rebuild mixed into whatever the caller committed later; (2)
+    when this function did own the transaction and its own outer
+    rollback itself failed (a real, reproduced case, not hypothetical),
+    the exception was swallowed and an ordinary ``False`` returned as if
+    cleanup had succeeded, when the transaction was in fact still open
+    with partial changes.
+
+    Both are fixed the same way: a ``SAVEPOINT`` scopes the rebuild+purge
+    regardless of transaction ownership, so ``ROLLBACK TO SAVEPOINT``
+    undoes only this function's own changes -- the caller's own pending
+    work, if any, is preserved untouched either way. If that savepoint
+    rollback/release ALSO fails, that is a strictly worse, genuinely
+    unresolved state (this function's own attempt to undo itself didn't
+    even succeed) -- raised as ``_FTSCleanupUnresolvedError`` rather than
+    silently reported as an ordinary ``False``, so a caller that needs to
+    stop (rather than proceed to log/recall writes or a commit on top of
+    unresolved state) has something concrete to catch.
     """
     # R2-F1: capture this BEFORE any write, so a caller's own already-open
     # transaction is never finalized by this function's commits below.
@@ -685,32 +717,52 @@ def _ensure_fts_index_consistent(conn) -> bool:
         return False  # schema not initialized -- nothing to check against
 
     try:
-        _rebuild_fts_index_or_raise(conn)
-        _commit_if_owned(conn, had_txn)
-        return True
+        conn.execute("SAVEPOINT fts_consistency_repair")
     except sqlite3.Error:
-        # BW-B1 fix (Ari's independent REV15 backward adversarial audit,
-        # 2026-09-15): the rebuild step imports EVERY row in `memories`
-        # regardless of eligibility (see _purge_ineligible_fts_rows's own
-        # docstring), then the purge removes the ineligible ones -- if the
-        # rebuild succeeds but the purge itself then fails, this used to
-        # just return False with no cleanup, leaving the rebuild's raw FTS
-        # import (including ineligible rows) sitting uncommitted in
-        # whatever transaction this function opened. Ari's reproduction:
-        # a subsequent verification call sees that still-open transaction,
-        # correctly treats it as caller-owned (this function's own
-        # ownership rule), and ends up committing the partial, broken
-        # rebuild -- a real ineligible posting persisted through to
-        # production. Only roll back when THIS call opened the
-        # transaction (`not had_txn`, captured before any write above) --
-        # a transaction this function did not open is never finalized
-        # here, in either direction, same as everywhere else in this file.
-        if not had_txn:
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                pass
+        return False  # cannot even open the savepoint -- nothing attempted, nothing to undo
+
+    try:
+        _rebuild_fts_index_or_raise(conn)
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT fts_consistency_repair")
+            conn.execute("RELEASE SAVEPOINT fts_consistency_repair")
+        except sqlite3.Error as cleanup_error:
+            raise _FTSCleanupUnresolvedError(
+                "FTS rebuild/purge failed and undoing it via SAVEPOINT also failed -- "
+                "unresolved partial index state"
+            ) from cleanup_error
         return False
+
+    try:
+        conn.execute("RELEASE SAVEPOINT fts_consistency_repair")
+    except sqlite3.Error as cleanup_error:
+        # The rebuild+purge itself succeeded, but releasing the savepoint
+        # failed -- same unresolved-state class as above, just at the
+        # opposite (success) branch. Do not proceed to _commit_if_owned
+        # on top of this.
+        raise _FTSCleanupUnresolvedError(
+            "FTS rebuild/purge succeeded but releasing its savepoint failed"
+        ) from cleanup_error
+
+    _commit_if_owned(conn, had_txn)
+    return True
+
+
+class _FTSCleanupUnresolvedError(sqlite3.Error):
+    """Raised by ``_ensure_fts_index_consistent`` when its own
+    SAVEPOINT-scoped cleanup (``ROLLBACK TO SAVEPOINT``/``RELEASE``)
+    fails, in either direction -- a strictly worse, unresolved state than
+    an ordinary ``False`` return, since this function's own attempt to
+    undo (or finalize) its changes did not even succeed. Subclasses
+    ``sqlite3.Error`` so any existing bare ``except sqlite3.Error``
+    elsewhere still catches it as a safety net (preserving every other
+    caller's pre-existing behavior unchanged), but is distinctly named so
+    a caller that actually needs to (``tool_memory_search``, via
+    ``_cold_start_check_once``) can catch it specifically and stop before
+    any further log/recall write or commit, rather than silently
+    proceeding on top of genuinely unresolved state -- Ari's independent
+    REV15/16 backward adversarial audit, 2026-09-15."""
 
 
 def _rebuild_fts_index_or_raise(conn) -> None:
@@ -1264,7 +1316,17 @@ def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch
     else:
         return results, False, False  # nothing returned, no way to check for omissions
 
-    repaired = _ensure_fts_index_consistent(db)
+    # BW-B1 fix (Ari's independent REV15/16 backward adversarial audit,
+    # 2026-09-15): _ensure_fts_index_consistent can now raise
+    # _FTSCleanupUnresolvedError in its own genuinely-unresolved-cleanup
+    # case. This function's own external contract (never raises, reports
+    # repair_failed=True instead) predates that change and is preserved
+    # here rather than reopened -- an unresolved cleanup is at least as
+    # bad as an ordinary repair failure from this caller's point of view.
+    try:
+        repaired = _ensure_fts_index_consistent(db)
+    except _FTSCleanupUnresolvedError:
+        repaired = False
     return rerun(), not repaired, False
 
 
@@ -2057,7 +2119,18 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     # Cold-start FTS health check (issue #97-2), once per (db, its current
     # file state) -- see _cold_start_check_once() for the guard logic itself,
     # pulled out as its own unit so it's directly testable (R2-F3/F7).
-    _cold_start_check_once(db, DB_PATH)
+    # BW-B1 fix (Ari's independent REV15/16 backward adversarial audit,
+    # 2026-09-15): _ensure_fts_index_consistent can raise
+    # _FTSCleanupUnresolvedError when even its own undo-attempt fails --
+    # a genuinely unresolved partial-index state, not an ordinary "nothing
+    # needed fixing" or "fix attempted and cleanly failed" case. Stop here,
+    # before any further read, log write, or recall-footprint write below,
+    # rather than silently proceeding on top of it.
+    try:
+        _cold_start_check_once(db, DB_PATH)
+    except _FTSCleanupUnresolvedError:
+        db.close()
+        return {"ok": False, "index_verification_failed": True}
 
     # Theta-gamma slot cap — enforce 7*tier max slots per retrieval cycle.
     # Tier 1 (default) → 7 slots, tier 2 → 14, tier 3 → 21.
