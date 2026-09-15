@@ -693,6 +693,231 @@ def _ensure_fts_index_consistent(conn) -> bool:
         return False
 
 
+_BUSY_SNAPSHOT = "busy_snapshot"
+
+
+def _classify_sqlite_error(e: sqlite3.Error) -> str:
+    """Distinguish SQLITE_BUSY_SNAPSHOT (restart the whole verification
+    attempt -- a concurrent writer committed between this call's snapshot
+    and its first write-since-read, not an ordinary lock wait) from any
+    other sqlite3.Error (a real repair/verification failure). Classified
+    via the actual extended result code (`e.sqlite_errorcode`), never by
+    matching the exception's message text -- v5 design doc, V3-3."""
+    return _BUSY_SNAPSHOT if getattr(e, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY_SNAPSHOT else "other"
+
+
+def _build_ordered_reference(fts_q: str, eligible_rows, limit) -> tuple:
+    """Build the ordered top-k reference id list for restore-time search
+    verification (RESTORE_VERIFICATION_DESIGN_v5_state_machine, B2/D1).
+
+    The disposable ``:memory:`` FTS5 table MUST use the exact same
+    tokenize argument and column list as production ``memories_fts``
+    (content, category, tags, tokenize='porter unicode61') -- if it used
+    SQLite's FTS5 defaults instead, bm25 order would not match even on a
+    provably healthy database, and every single search would falsely
+    trigger the repair path (v5 B2). This mirrors
+    ``_fts_matches_real_content``'s table exactly; kept as a separate
+    function because that one returns an unordered set for membership
+    checking (R8-R11's mechanism) and this one returns an ORDERED top-k
+    list, which R8-R11 never verified (R11-B2, deliberately left open
+    there as a product decision -- this function is that decision,
+    implemented). Tie-break ``ORDER BY rank, rowid`` per D1/v4; the
+    caller must apply the identical tie-break on the production side.
+
+    Returns ``(ordered_ids: list, ok: bool)`` -- ``ok`` is False only if
+    the reference table itself could not be built or queried, distinct
+    from "built fine, zero matches" (an empty list with ``ok=True``).
+    """
+    verify_conn = None
+    try:
+        verify_conn = sqlite3.connect(":memory:")
+        verify_conn.execute(
+            "CREATE VIRTUAL TABLE reference USING fts5(content, category, tags, tokenize='porter unicode61')"
+        )
+        verify_conn.executemany(
+            "INSERT INTO reference(rowid, content, category, tags) VALUES (?, ?, ?, ?)",
+            [(i, c or "", cat or "", t or "") for i, c, cat, t in eligible_rows],
+        )
+        rows = verify_conn.execute(
+            "SELECT rowid FROM reference WHERE reference MATCH ? ORDER BY rank, rowid LIMIT ?",
+            (fts_q, limit),
+        ).fetchall()
+        return [r[0] for r in rows], True
+    except sqlite3.Error:
+        return [], False
+    finally:
+        if verify_conn is not None:
+            verify_conn.close()
+
+
+def _repair_and_reverify_once(db, fts_q: str, fetch_eligible_content, limit, primary_pre, rerun_primary):
+    """One savepoint-guarded repair-and-reverify attempt (v5 step 4).
+    Returns ``_BUSY_SNAPSHOT`` (caller restarts the whole outer attempt --
+    v5's per-stage busy-snapshot classification, applied here to the
+    repair call, the fresh-reference fetch, and the primary rerun alike,
+    not only the rebuild) or a ``(commit: bool, result: dict)`` pair.
+
+    ``primary_pre`` and the rerun results from ``rerun_primary()`` are
+    full result-row lists (dicts with an ``"id"`` key, same shape
+    ``tool_memory_search`` already works with), not bare id lists -- ids
+    are extracted here only for the comparisons themselves, so the
+    returned ``result["results"]`` is always something the caller can use
+    directly for reranking/formatting without a second query.
+
+    Deliberately does NOT call ``_ensure_fts_index_consistent`` here: that
+    function performs its own ``_commit_if_owned`` internally (a second,
+    independent commit that would end this function's own savepoint
+    early) and its ``except sqlite3.Error: return False`` swallows the
+    real error before this function could classify it as busy-snapshot
+    vs. ordinary failure. Per v5's V3-3: the verification path calls the
+    rebuild+purge logic through its own inline try/except that inspects
+    ``sqlite_errorcode`` before savepoint cleanup runs, so the
+    classification survives ``ROLLBACK TO SAVEPOINT``/``RELEASE`` rather
+    than being lost inside it. The actual rebuild+purge SQL is identical
+    to ``_ensure_fts_index_consistent``'s -- kept in exact sync with it by
+    inspection, not by a shared call, since the transaction discipline
+    the two need is genuinely different.
+    """
+    try:
+        db.execute("SAVEPOINT restore_verify_repair")
+    except sqlite3.Error:
+        return False, {"results": None, "ok": False, "flag": None}
+
+    try:
+        db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        _purge_ineligible_fts_rows(db)
+        fresh_reference_ids, fresh_ref_ok = _build_ordered_reference(fts_q, fetch_eligible_content(), limit)
+        if not fresh_ref_ok:
+            raise sqlite3.OperationalError("reference rebuild failed after repair")
+        rerun_results = rerun_primary()
+        rerun_ids = [r["id"] for r in rerun_results]
+    except sqlite3.Error as e:
+        classification = _classify_sqlite_error(e)
+        try:
+            db.execute("ROLLBACK TO SAVEPOINT restore_verify_repair")
+            db.execute("RELEASE SAVEPOINT restore_verify_repair")
+        except sqlite3.Error:
+            pass
+        if classification == _BUSY_SNAPSHOT:
+            return _BUSY_SNAPSHOT
+        return False, {"results": None, "ok": False, "flag": "index_repair_failed"}
+
+    if rerun_ids == fresh_reference_ids:
+        try:
+            db.execute("RELEASE SAVEPOINT restore_verify_repair")
+        except sqlite3.Error:
+            return False, {"results": None, "ok": False, "flag": "index_verification_failed"}
+        return True, {"results": rerun_results, "ok": True, "flag": None}
+
+    # B3: return primary_pre (captured before this savepoint ever opened),
+    # never the rolled-back rerun's rows, never a fresh re-read (which
+    # could observe a later writer and break the isolation this design
+    # depends on).
+    try:
+        db.execute("ROLLBACK TO SAVEPOINT restore_verify_repair")
+        db.execute("RELEASE SAVEPOINT restore_verify_repair")
+    except sqlite3.Error:
+        return False, {"results": None, "ok": False, "flag": "index_verification_failed"}
+    return True, {"results": primary_pre, "ok": True, "flag": "repair_verification_failed"}
+
+
+def _verify_restore_time_order(db, fts_q: str, fetch_eligible_content, limit, primary_pre, rerun_primary):
+    """Restore-time search correctness, v5 state machine
+    (``RESTORE_VERIFICATION_DESIGN_v5_state_machine_2026-09-15.md``).
+    Ordered top-k comparison against a schema-matched in-memory reference,
+    snapshot-owned, savepoint-guarded repair. This is the R11-B2 product
+    decision Ari's REV11 explicitly deferred: ``_verify_and_repair_stale_matches``
+    verifies set MEMBERSHIP/completeness only and never verified relevance
+    ORDER after a restore; this function does, and its own docstring
+    should be read alongside that one's for the full history.
+
+    ``primary_pre`` is the caller's ALREADY-EXECUTED primary query's
+    ordered result-row list (full dicts, not bare ids) -- the design
+    doc's ``primary_pre``, captured by the caller at the point it ran the
+    query, before any savepoint here could exist. This function never
+    re-reads primary before the first comparison; only a mismatch
+    triggers ``rerun_primary()``, once, inside the savepoint (v5 step 4).
+    One adaptation from the design doc's own step 2, worth being explicit
+    about: the doc bundles "read primary AND reference" as one step whose
+    failure is B1 row 0 (verification-fetch failure); in this codebase
+    the primary read already happened in the caller before this function
+    is even called, so B1 row 0 here can only ever be the REFERENCE build
+    failing, never the primary read -- the two are already decoupled by
+    the surrounding code, not by a choice made here.
+
+    Returns ``{"results": [...] or None, "ok": bool, "flag": None |
+    "index_repair_failed" | "repair_verification_failed" |
+    "index_verification_failed"}``. ``results`` is ``None`` only when
+    ``ok`` is False with nothing honest to report (B1 row 0, ordinary
+    repair/rerun failure, or snapshot exhaustion with no primary in hand
+    -- the last of which cannot actually occur through this call site,
+    since ``primary_pre`` is always supplied already-read; kept in the
+    general logic below for any future caller that might not have one
+    yet).
+    """
+    had_txn = getattr(db, "in_transaction", False)
+    primary_pre_ids = [r["id"] for r in primary_pre]
+
+    def _finalize(commit: bool) -> bool:
+        # Caller-owned transactions are never finalized here, in either
+        # direction -- only this function's own savepoint (if any) was
+        # ever touched above.
+        if had_txn:
+            return True
+        try:
+            db.commit() if commit else db.rollback()
+            return True
+        except sqlite3.Error:
+            return False
+
+    for _attempt in range(3):
+        try:
+            if not had_txn:
+                db.execute("BEGIN DEFERRED")
+            reference_ids, ref_ok = _build_ordered_reference(fts_q, fetch_eligible_content(), limit)
+            if not ref_ok:
+                raise sqlite3.OperationalError("reference build failed")
+        except sqlite3.Error as e:
+            busy = _classify_sqlite_error(e) == _BUSY_SNAPSHOT
+            # Whether this is a busy-snapshot retry or a real failure, the
+            # transaction this attempt just opened (if owned) must be
+            # rolled back before either retrying BEGIN DEFERRED (which
+            # raises "cannot start a transaction within a transaction" on
+            # top of one already open) or returning -- _finalize already
+            # no-ops correctly when had_txn is True.
+            _finalize(commit=False)
+            if busy:
+                continue  # restart the whole attempt from the top
+            return {"results": None, "ok": False, "flag": None}  # B1 row 0
+
+        if primary_pre_ids == reference_ids:
+            _finalize(commit=True)
+            return {"results": primary_pre, "ok": True, "flag": None}  # B1 row 1: no mismatch
+
+        outcome = _repair_and_reverify_once(db, fts_q, fetch_eligible_content, limit, primary_pre, rerun_primary)
+        if outcome == _BUSY_SNAPSHOT:
+            # _repair_and_reverify_once already rolled back to its own
+            # SAVEPOINT and released it on this path -- but the OUTER
+            # transaction this function opened above (if owned) is still
+            # open at that point, and must be rolled back too before the
+            # next attempt's BEGIN DEFERRED, same reasoning as above.
+            _finalize(commit=False)
+            continue  # restart the whole attempt from the top
+        commit, result = outcome
+        _finalize(commit)
+        return result
+
+    # Snapshot retries exhausted (v5): keep only this final attempt's own
+    # state. primary_pre is always present through this call site (see
+    # docstring), so this always takes the "had a primary in hand" branch
+    # in practice; the other branch is kept for a hypothetical caller with
+    # no primary result yet.
+    _finalize(commit=False)
+    if primary_pre is not None:
+        return {"results": primary_pre, "ok": True, "flag": "index_verification_failed"}
+    return {"results": None, "ok": False, "flag": None}
+
+
 def _fts_matches_real_content(fts_q: str, id_field_rows) -> tuple:
     """Build one small, disposable, in-memory FTS5 table (same tokenizer AND
     same three indexed columns as the real index: content, category, tags --
@@ -1757,21 +1982,41 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
             f"SELECT m.id, m.content, m.category, m.tags FROM memories m WHERE {where}", _search_where_params
         ).fetchall()
 
-    # R9-B1 fix (Ari's independent REV9 audit, 2026-09-11), corrected by
-    # R10-B1/R10-B2/R10-B3 (Ari's independent REV10 audit, 2026-09-14):
-    # verify every returned row's real content actually satisfies the
-    # query it supposedly matched AND that no eligible row was silently
-    # omitted, self-heal immediately if not -- see
-    # _verify_and_repair_stale_matches's own docstring for the full
-    # reasoning and the real, accepted cost of always checking
-    # completeness rather than only on empty results. Runs
-    # unconditionally, including under benchmark=True -- correctness
-    # isn't the thing benchmark mode opts out of, reranking is.
-    # `limit` (already tier-capped above) is passed through so R11-B1's
-    # fix can tell ordinary bounded truncation apart from real omission.
-    results, _index_repair_failed, _index_verification_failed = _verify_and_repair_stale_matches(
-        db, fts_q, results, _run_primary_query, _fetch_eligible_content, limit
+    # v5 state machine (RESTORE_VERIFICATION_DESIGN_v5_state_machine_2026-09-15.md),
+    # replacing the call to _verify_and_repair_stale_matches at this site
+    # (REV13, 2026-09-15). That function is left in place, unchanged and
+    # still covered by its own tests, but no longer called from here --
+    # its set-membership check never verified relevance ORDER after a
+    # restore (R11-B2, deliberately left open there as a product decision
+    # for Kelly). This is that decision, implemented: ordered top-k
+    # comparison against a schema-matched reference, snapshot-owned,
+    # savepoint-guarded repair, busy-snapshot classified via
+    # sqlite_errorcode. Runs unconditionally, including under
+    # benchmark=True -- correctness isn't the thing benchmark mode opts
+    # out of, reranking is. `limit` (already tier-capped above) bounds
+    # the reference's own top-k the same way the primary query is bounded.
+    _verify_outcome = _verify_restore_time_order(
+        db, fts_q, _fetch_eligible_content, limit, results, _run_primary_query
     )
+    if not _verify_outcome["ok"]:
+        # v5 B1: a real, unrepaired failure -- nothing honest to return.
+        # No `count`/`memories` keys, per the design doc's own wording --
+        # distinct from the fail-open "ok: true + stale hits + a flag"
+        # shape used below for the cases where something legitimate can
+        # still be reported. _verify_restore_time_order already finalized
+        # (rolled back) its own transaction before returning here.
+        db.close()
+        error_result = {"ok": False}
+        if _verify_outcome["flag"] == "index_repair_failed":
+            error_result["index_repair_failed"] = True
+        return error_result
+    results = _verify_outcome["results"]
+    # v5's third flag, distinct from the two below: a repair was attempted,
+    # succeeded as a SQL operation, but the rerun still disagreed with a
+    # fresh reference -- rolled back, `results` here is the honest
+    # pre-repair primary, not the discarded rerun (B3).
+    _repair_verification_failed = _verify_outcome["flag"] == "repair_verification_failed"
+    _index_verification_failed = _verify_outcome["flag"] == "index_verification_failed"
 
     # CLS semantic bonus: when no type filter is set, apply a mild confidence
     # multiplier to semantic memories so they score slightly above equivalent
@@ -1998,15 +2243,14 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
               "slot_cap": max_slots, "tier": tier}
     if borrow_from:
         result["borrowed_from"] = borrow_from
-    if _index_repair_failed:
-        # Self-audited addition, not part of Ari's original R9-B1 report:
-        # real content proved the raw FTS index needed a rebuild, and that
-        # rebuild itself then failed. Silently returning `ok: True` here
-        # (the first version of this fix did exactly that) would be the
-        # identical class of bug R9-B2 fixes at the caching layer, just
-        # reintroduced at this call site -- results below may be
-        # incomplete or stale despite `ok: True`.
-        result["index_repair_failed"] = True
+    if _repair_verification_failed:
+        # v5 B1: a repair was attempted, ran as a SQL operation without
+        # raising, but the rerun still disagreed with a fresh reference --
+        # rolled back. `results` here is the honest pre-repair primary
+        # (B3), not the discarded rerun. Distinct from `index_repair_failed`
+        # below (that's an outright SQL failure during repair; this is a
+        # repair that ran clean and simply didn't converge).
+        result["repair_verification_failed"] = True
     if _index_verification_failed:
         # R10-B3 fix (Ari's independent REV10 audit, 2026-09-14): the
         # eligible-content fetch or the real-content FTS check itself

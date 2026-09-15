@@ -49,13 +49,23 @@ def _seed_stale_index_db(db_path):
 
 def test_failed_repair_inside_verify_path_is_surfaced_not_swallowed(tmp_path, monkeypatch):
     """A rebuild denied at the SQLite authorizer level, triggered by the
-    R9-B1 verify-and-repair path itself (not the earlier _cold_start_check_once
+    verify-and-repair path itself (not the earlier _cold_start_check_once
     gate -- this deliberately never lets that gate run its own rebuild, so
-    the ONLY rebuild attempt in this whole call happens inside
-    _verify_and_repair_stale_matches). Before this fix: `ok: True, count: 0`,
-    silently indistinguishable from a genuine "nothing found." After: the
-    same silent-content result, but `index_repair_failed: True` present so
-    a caller can tell the difference."""
+    the ONLY rebuild attempt in this whole call happens inside the
+    verification path under test).
+
+    Contract updated by RESTORE_VERIFICATION_DESIGN_v5_state_machine
+    (REV13, 2026-09-15): this call site now runs through
+    `_verify_restore_time_order`, not `_verify_and_repair_stale_matches`
+    (unchanged, still tested elsewhere in this file -- only
+    `tool_memory_search`'s call site moved). v5's B1 table makes this an
+    `ok: False`, no `count`/`memories` keys outcome, not the old
+    `ok: True, count: 0, index_repair_failed: True` fail-open shape --
+    a repair that failed outright (not one that ran and simply didn't
+    converge, which IS still fail-open under `repair_verification_failed`)
+    has nothing honest to report. Still the real thing this test cares
+    about: a denied rebuild must be surfaced, not silently swallowed into
+    an ordinary-looking zero-result search."""
     import agentmemory.mcp_server as srv
 
     db_path = tmp_path / "stale.db"
@@ -82,10 +92,14 @@ def test_failed_repair_inside_verify_path_is_surfaced_not_swallowed(tmp_path, mo
 
     result = srv.tool_memory_search(agent_id="t", query="wantednewtoken", benchmark=True)
 
-    assert result["ok"] is True, "search itself must not raise/crash on a denied rebuild"
-    assert result["count"] == 0, (
-        "sanity: with the rebuild denied, the real content genuinely can't be "
-        "recovered this call -- the point of this test is the flag, not a miracle fix"
+    assert result["ok"] is False, (
+        "v5 B1: a mismatch was detected AND the resulting rebuild failed "
+        "outright -- a real, unrepaired failure, not a flagged success. "
+        "The tool call itself must not raise/crash on the denied rebuild, "
+        "but it must not claim ok:True either"
+    )
+    assert "count" not in result and "memories" not in result, (
+        "v5's own wording for this row: no count/memories keys"
     )
     assert result.get("index_repair_failed") is True, (
         "a real content/index mismatch was detected AND the resulting rebuild "

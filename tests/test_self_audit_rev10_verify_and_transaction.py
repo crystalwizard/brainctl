@@ -53,11 +53,23 @@ def _seed_stale_index_db(db_path):
 
 
 def test_verifier_connection_failure_surfaces_index_verification_failed(tmp_path, monkeypatch):
-    """R10-B3: a stale index PLUS a verifier that itself can't run (its
-    :memory: connection denied) must not collapse into an ordinary-looking
-    `ok: True, count: 0` -- the same silent-wrong-answer shape this whole
-    branch exists to prevent, just at the verifier layer instead of the
-    index layer."""
+    """R10-B3, contract updated by RESTORE_VERIFICATION_DESIGN_v5_state_machine
+    (REV13, 2026-09-15): this call site now runs through
+    `_verify_restore_time_order`, not `_verify_and_repair_stale_matches`
+    (that function is unchanged and still tested elsewhere in this file --
+    only `tool_memory_search`'s call site moved). v5's B1 table makes a
+    deliberate, reviewed contract change for exactly this case
+    (verification-fetch failure before any comparison is even possible):
+    `ok: False`, no `count`/`memories` keys at all -- not the old
+    `ok: True, count: 0, index_verification_failed: True` fail-open shape.
+    Grok's BCTL-15 review confirmed the OTHER fail-open case
+    (`repair_verification_failed`, a repair that ran but didn't converge)
+    is correct direction-A behavior; this case is different -- nothing was
+    ever established here, not even a stale-but-known answer, so there is
+    nothing honest to attach a `count` to. Still asserting the real thing
+    R10-B3 cared about: a denied verifier connection must not silently
+    look like an ordinary clean search. It still doesn't -- it's just
+    `ok: False` now instead of a flag on top of `ok: True`."""
     import agentmemory.mcp_server as srv
 
     db_path = tmp_path / "verification-error.db"
@@ -85,11 +97,15 @@ def test_verifier_connection_failure_surfaces_index_verification_failed(tmp_path
 
     result = srv.tool_memory_search(agent_id="t", query="realneedle", benchmark=True)
 
-    assert result["ok"] is True, "search itself must not raise/crash on a denied verifier connection"
-    assert result["count"] == 0, "sanity: the stale index genuinely can't be verified this call"
-    assert result.get("index_verification_failed") is True, (
-        "a verifier-connection failure on top of a stale index must be surfaced, "
-        "not silently reported as an ordinary successful zero-result search"
+    assert result["ok"] is False, (
+        "v5 B1 row 0: a verifier-connection failure before any comparison "
+        "was even possible is a real, unrepaired failure, not a flagged "
+        "success -- the tool call itself must not raise/crash, but it "
+        "must not claim ok:True either"
+    )
+    assert "count" not in result and "memories" not in result, (
+        "v5's own wording for this row: no count/memories keys -- there is "
+        "nothing honest to report, not even a stale answer"
     )
 
 
