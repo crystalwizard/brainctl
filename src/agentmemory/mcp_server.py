@@ -781,12 +781,19 @@ def _build_ordered_reference(fts_q: str, full_eligible_rows, row_matches_filter,
             "SELECT rowid FROM reference WHERE reference MATCH ? ORDER BY rank, rowid",
             (fts_q,),
         ).fetchall()
+        # R14-B2 fix (Ari's independent REV14 audit, 2026-09-15): the
+        # limit check must happen BEFORE appending, not after -- the first
+        # version appended a matching row, then checked whether the count
+        # had reached `limit`, so limit=0 still appended exactly one row
+        # before its own check fired. Production's SQL `LIMIT 0` returns
+        # zero rows, full stop; the reference must match that exactly or
+        # a healthy limit=0 search falsely disagrees with itself.
         ordered_ids = []
         for (rid,) in ranked:
+            if len(ordered_ids) >= limit:
+                break
             if row_matches_filter(by_id[rid]):
                 ordered_ids.append(rid)
-                if len(ordered_ids) >= limit:
-                    break
         return ordered_ids, True
     except sqlite3.Error:
         return [], False
@@ -994,7 +1001,17 @@ def _verify_restore_time_order(db, fts_q: str, fetch_full_eligible, row_matches_
             continue  # discard this attempt entirely; try a fresh one
         commit, result = outcome
         if not result["ok"]:
-            _finalize(commit=False)  # best-effort; result already reflects the real failure
+            # R14-B1 fix (Ari's independent REV14 audit, 2026-09-15): this
+            # outer rollback's own return value was being discarded -- an
+            # injected rerun error followed by a failed outer rollback
+            # still returned the inner result's ordinary index_repair_failed
+            # unchanged, with the outer transaction left open. That's a
+            # worse, unresolved-cleanup state than an ordinary repair
+            # failure and must be promoted to index_verification_failed,
+            # not silently reported as the milder flag. Still ok=false,
+            # still no retry -- only the lost signal is being restored here.
+            if not _finalize(commit=False):
+                result = {"results": None, "ok": False, "flag": "index_verification_failed"}
             return result
         if not _finalize(commit):
             # R13-B1: a failed commit/rollback after a real comparison
