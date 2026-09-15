@@ -782,6 +782,14 @@ def _rebuild_fts_index_or_raise(conn) -> None:
 
 _BUSY_SNAPSHOT = "busy_snapshot"
 
+# Release-gate cooperative verification budget (D4) -- see
+# _verify_restore_time_order's own docstring for the real measurement
+# this number is based on (2026-09-15: 12.66ms/213 rows, 22.54ms/2000,
+# 74.62ms/10000 healthy; 112ms/10000 forced full rebuild). Cooperative
+# only: checked before starting an attempt, never interrupts one already
+# running.
+_VERIFY_COOPERATIVE_BUDGET_SECONDS = 2.0
+
 
 def _classify_sqlite_error(e: sqlite3.Error) -> str:
     """Distinguish SQLITE_BUSY_SNAPSHOT (restart the whole verification
@@ -992,6 +1000,25 @@ def _verify_restore_time_order(db, fts_q: str, fetch_full_eligible, row_matches_
     checked. A failed owned commit or rollback is terminal -- no retry,
     no claiming a comparison result that was never actually finalized.
 
+    **Release-gate fix, cooperative verification budget (D4, real
+    measurement 2026-09-15, not an arbitrary number):** measured directly
+    against synthetic corpora before picking a threshold -- the healthy
+    verification path (no repair needed) averaged 12.66ms at 213 rows
+    (today's actual real corpus size), 22.54ms at 2,000, 74.62ms at
+    10,000; a forced full-rebuild repair at 10,000 rows took 112ms. Cost
+    scales with total corpus size on every call (the reference is rebuilt
+    from the full eligible corpus every attempt, not only on repair), not
+    just on failure. ``_VERIFY_COOPERATIVE_BUDGET_SECONDS`` (2.0) is
+    checked before starting the 2nd and 3rd retry attempts only -- this is
+    cooperative, not preemptive: it can skip an attempt that hasn't
+    started yet, it cannot interrupt one already in flight (v4's own
+    stated limit of this mechanism, unchanged here). At a corpus roughly
+    35x today's real size, three full attempts would still fit inside
+    this budget with room to spare; it exists to bound genuinely
+    pathological cases (repeated busy-snapshot contention against a much
+    larger future corpus), not to fire under any condition measured
+    today.
+
     Returns ``{"results": [...] or None, "ok": bool, "flag": None |
     "index_repair_failed" | "repair_verification_failed" |
     "index_verification_failed"}``. ``results`` is ``None`` only when
@@ -999,6 +1026,7 @@ def _verify_restore_time_order(db, fts_q: str, fetch_full_eligible, row_matches_
     """
     had_txn = getattr(db, "in_transaction", False)
     _last_primary_results = None  # R13-B2: the most recent attempt's own primary, discarded each retry
+    _verify_start = time.monotonic()
 
     def _finalize(commit: bool) -> bool:
         # Caller-owned transactions are never finalized here, in either
@@ -1013,6 +1041,14 @@ def _verify_restore_time_order(db, fts_q: str, fetch_full_eligible, row_matches_
             return False
 
     for _attempt in range(3):
+        # Cooperative budget (D4): only checked before STARTING an
+        # attempt, never mid-flight. _attempt == 0 always runs regardless
+        # of budget -- a caller gets at least one real verification
+        # attempt no matter how the clock looks; only the 2nd/3rd retry
+        # can be skipped this way. Exhaustion below already handles
+        # reporting whatever the most recent attempt actually obtained.
+        if _attempt > 0 and (time.monotonic() - _verify_start) >= _VERIFY_COOPERATIVE_BUDGET_SECONDS:
+            break
         primary_results = None
         # Reset in lockstep with primary_results at the top of every
         # attempt, not just on success -- otherwise a final attempt that
@@ -2181,9 +2217,18 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     params.append(limit)
 
     def _run_primary_query():
+        # Release-gate fix (production tie-break, retained-open item from
+        # v4/v5/D1 -- "still open, not blocking" until now): `rank` alone
+        # can tie between rows with equal bm25 scores, and SQLite does not
+        # guarantee any particular order among ties. _build_ordered_reference
+        # has always broken ties with `rowid` (== memories.id); this query
+        # never did, so a real tie could disagree between the two on ORDER
+        # even when both sides are perfectly healthy -- a false positive
+        # this design has been vulnerable to since v2. `m.id` matches the
+        # reference's `rowid` tie-break exactly (same underlying value).
         return rows_to_list(db.execute(
             f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
-            f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank LIMIT ?", params
+            f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank, m.id LIMIT ?", params
         ).fetchall())
 
     def _fetch_full_eligible_content():
