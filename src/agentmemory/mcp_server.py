@@ -2432,11 +2432,37 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                 if fts_q2:
                     params2 = [fts_q2] + [p for p in params[1:] if p != limit]
                     params2.append(limit)
-                    rows2 = db.execute(
-                        f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
-                        f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank LIMIT ?", params2
-                    ).fetchall()
-                    pass2 = rows_to_list(rows2)
+
+                    # BCTL-18 fix (Morrow's independent blind test,
+                    # 2026-09-15/16): this second, enrichment-query FTS
+                    # lookup used to run as a bare db.execute, bypassing
+                    # _verify_restore_time_order entirely -- the same
+                    # restore-time staleness the primary query is protected
+                    # against could silently omit or add a pass-2 row,
+                    # reproduced both directions under a real same-path
+                    # file-replacement restore, with the primary path clean.
+                    # Fix: run pass-2 through the identical verified-primary
+                    # state machine, reusing the same _fetch_full_eligible_content
+                    # and _row_matches_filter closures (they mirror the same
+                    # `where`/params used above, unfiltered-corpus reference
+                    # included) -- the only thing that changes per call is
+                    # which FTS query and query-runner get verified.
+                    def _run_pass2_primary():
+                        return rows_to_list(db.execute(
+                            f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
+                            f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank, m.id LIMIT ?", params2
+                        ).fetchall())
+
+                    _pass2_verify_outcome = _verify_restore_time_order(
+                        db, fts_q2, _fetch_full_eligible_content, _row_matches_filter, limit, _run_pass2_primary
+                    )
+                    # Fail open on an unrepaired pass-2 verification failure --
+                    # same discipline as the outer try/except around this whole
+                    # block: multi_pass is an enrichment on top of an already-
+                    # verified primary result, so a pass-2 verification problem
+                    # degrades to "no enrichment this call," never to discarding
+                    # or corrupting the already-verified primary `results`.
+                    pass2 = _pass2_verify_outcome["results"] if _pass2_verify_outcome["ok"] else []
                     pass1_ids = {r["id"] for r in results}
 
                     # Continuity gate: a pass-2 hit must contain at least
