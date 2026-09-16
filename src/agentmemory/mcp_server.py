@@ -618,6 +618,84 @@ def _cold_start_check_once(conn, db_path) -> bool:
     return repaired
 
 
+def _refresh_fts_check_fingerprint(db_key: str, db_path) -> None:
+    """Self-touch/write-amplification fix (Morrow's independent blind test,
+    2026-09-15/16, non-blocking caveat named alongside BCTL-18): the file
+    fingerprint `_cold_start_check_once` caches is always captured at the
+    very TOP of that function -- before this call's own search runs, before
+    any repair it triggers, and before this call's own `log_access`/recall-
+    boost writes and final `commit()`. Those bookkeeping writes reliably
+    advance the database file's mtime (often its size too), so the NEXT
+    call's `_cold_start_check_once` sees "file touched since last checked"
+    and runs a full, unconditional `_ensure_fts_index_consistent` rebuild --
+    even though nothing actually happened between calls except this
+    process's own ordinary bookkeeping. Reproduced directly: four ordinary
+    searches spaced across this filesystem's mtime-granularity bucket
+    triggered four full rebuilds, one per call, purely from each call's own
+    trailing writes.
+
+    Fix: after a call's own writes are fully committed, re-stamp the SAME
+    cache entry `_cold_start_check_once` may have read or written earlier in
+    this same call with the file's CURRENT (post-write) fingerprint. The
+    next call then compares against "what the file looked like after the
+    last call's own writes," not "what it looked like before them" -- so
+    only a genuine out-of-band touch between calls (an actual restore) still
+    reads as `file_touched`, not this process's own ordinary bookkeeping.
+
+    Deliberately narrow: only refreshes an EXISTING cache entry's
+    fingerprint half, never creates one and never touches the `last_checked`
+    timestamp half -- cache lifecycle (when to next run a full check, TTL
+    expiry) stays entirely `_cold_start_check_once`'s own responsibility.
+    If no entry exists yet for this (path, instance) -- e.g. the very first
+    call ever, or `_db_instance_id` wasn't stampable -- there's nothing to
+    refresh and this is a deliberate no-op, not an error.
+
+    Safe to call even if the repair path was taken this call (the fresh
+    file_fp captured here reflects the rebuild's own writes too, same as
+    any other write) or if `_cold_start_check_once` was never called at all
+    this request (also a no-op, same reasoning).
+
+    **Must be called AFTER the connection is closed, not before** -- found
+    by direct measurement, not assumed: closing a connection can itself
+    trigger SQLite's own WAL checkpoint, which is what actually flushes
+    the accumulated writes into the main database file and bumps ITS
+    mtime. Calling this while `conn` is still open (even after `commit()`)
+    captured the file's PRE-checkpoint fingerprint every time, identical
+    to the stale one already cached -- a real no-op bug caught by tracing
+    actual stat() values through a live run rather than trusting the logic
+    read correctly on paper. `db_key` must therefore be resolved from the
+    connection BEFORE closing it (via `resolve_fts_check_db_key` below) and
+    passed in here as a plain string, since this function itself no longer
+    touches `conn` at all."""
+    if db_key not in _FTS_REBUILD_CHECKED_PATHS:
+        return
+
+    try:
+        _stat = os.stat(db_path)
+        file_fp = (_stat.st_mtime_ns, _stat.st_size)
+    except OSError:
+        return
+
+    last_checked, _stale_fp = _FTS_REBUILD_CHECKED_PATHS[db_key]
+    _FTS_REBUILD_CHECKED_PATHS[db_key] = (last_checked, file_fp)
+
+
+def _resolve_fts_check_db_key(conn, db_path) -> str:
+    """Compute the same `_FTS_REBUILD_CHECKED_PATHS` key `_cold_start_check_once`
+    uses, for a caller (`_refresh_fts_check_fingerprint`) that needs it AFTER
+    the connection that could answer `_db_instance_id` is already closed.
+    Call this BEFORE closing `conn`; pass the resulting string to the
+    refresh function AFTER closing it."""
+    instance_id = _db_instance_id(conn)
+    if instance_id is not None:
+        return f"{db_path}:instance:{instance_id}"
+    try:
+        _stat = os.stat(db_path)
+        return f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+    except OSError:
+        return str(db_path)
+
+
 def _commit_if_owned(conn, had_txn: bool) -> None:
     """R2-F1 fix: a helper that unconditionally calls conn.commit() finalizes
     whatever unrelated work the CALLER already had pending in an open
@@ -2603,7 +2681,25 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
         except Exception:
             pass
 
-    db.commit(); db.close()
+    db.commit()
+    # Self-touch fix: re-stamp the cold-start fingerprint cache with this
+    # call's own post-write file state -- see _refresh_fts_check_fingerprint's
+    # own docstring for why the db_key must be resolved BEFORE close() (needs
+    # the still-open connection) while the actual file stat must happen
+    # AFTER close() (closing is what actually checkpoints the WAL into the
+    # main file's mtime -- measured directly, not assumed). Best-effort
+    # only: a failure here must never affect the search result already
+    # computed.
+    try:
+        _fts_check_db_key = _resolve_fts_check_db_key(db, DB_PATH)
+    except Exception:
+        _fts_check_db_key = None
+    db.close()
+    if _fts_check_db_key is not None:
+        try:
+            _refresh_fts_check_fingerprint(_fts_check_db_key, DB_PATH)
+        except Exception:
+            pass
     result = {"ok": True, "count": len(results), "memories": results,
               "slot_cap": max_slots, "tier": tier}
     if borrow_from:
