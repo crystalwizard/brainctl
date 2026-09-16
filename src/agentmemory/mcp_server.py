@@ -2456,13 +2456,36 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                     _pass2_verify_outcome = _verify_restore_time_order(
                         db, fts_q2, _fetch_full_eligible_content, _row_matches_filter, limit, _run_pass2_primary
                     )
-                    # Fail open on an unrepaired pass-2 verification failure --
-                    # same discipline as the outer try/except around this whole
-                    # block: multi_pass is an enrichment on top of an already-
-                    # verified primary result, so a pass-2 verification problem
-                    # degrades to "no enrichment this call," never to discarding
-                    # or corrupting the already-verified primary `results`.
-                    pass2 = _pass2_verify_outcome["results"] if _pass2_verify_outcome["ok"] else []
+                    # Fail open on anything short of a fully clean pass-2
+                    # verification -- same discipline as the outer try/except
+                    # around this whole block: multi_pass is an enrichment on
+                    # top of an already-verified primary result, so any
+                    # pass-2 verification problem degrades to "no enrichment
+                    # this call," never to discarding or corrupting the
+                    # already-verified primary `results`.
+                    #
+                    # Morrow's independent adversarial recheck (2026-09-16,
+                    # Plane BCTL-18) caught a real gap in the first version
+                    # of this fix: `ok=True` alone is not "verified correct" --
+                    # _verify_restore_time_order also returns `ok=True` with
+                    # `flag="index_verification_failed"` (busy-snapshot
+                    # exhaustion under a caller-owned transaction, or owned-
+                    # retry exhaustion) and `flag="repair_verification_failed"`
+                    # (a repair was attempted but the rerun still disagreed,
+                    # so the honest PRE-repair -- i.e. still-stale -- primary
+                    # is what's returned). Both are real, documented, `ok=True`
+                    # shapes carrying UNCONFIRMED results, by design, for the
+                    # primary query (which must return something rather than
+                    # fail the whole search). Reproduced with a genuine
+                    # two-connection WAL SQLITE_BUSY_SNAPSHOT: the stale
+                    # addition-direction row silently passed through because
+                    # only `ok` was checked. Only `flag is None` means pass-2
+                    # was actually confirmed against a fresh reference.
+                    pass2 = (
+                        _pass2_verify_outcome["results"]
+                        if _pass2_verify_outcome["ok"] and _pass2_verify_outcome["flag"] is None
+                        else []
+                    )
                     pass1_ids = {r["id"] for r in results}
 
                     # Continuity gate: a pass-2 hit must contain at least
