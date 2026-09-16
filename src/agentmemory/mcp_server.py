@@ -2395,6 +2395,8 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     #   - Uses a longer min-token-length (5) and a richer stoplist for
     #     enrichment-term extraction.
     #   - Caps enrichment terms at 5 (down from 10) — fewer drift vectors.
+    _multi_pass_skipped = False
+    _multi_pass_skip_reason = None
     if multi_pass and results:
         try:
             seen_ids = {r["id"] for r in results}
@@ -2453,9 +2455,17 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                             f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank, m.id LIMIT ?", params2
                         ).fetchall())
 
-                    _pass2_verify_outcome = _verify_restore_time_order(
-                        db, fts_q2, _fetch_full_eligible_content, _row_matches_filter, limit, _run_pass2_primary
-                    )
+                    try:
+                        _pass2_verify_outcome = _verify_restore_time_order(
+                            db, fts_q2, _fetch_full_eligible_content, _row_matches_filter, limit, _run_pass2_primary
+                        )
+                    except Exception:
+                        # Pass-2 is optional enrichment. Preserve the already-
+                        # verified primary result, but do not make the failed
+                        # enrichment attempt invisible to the caller.
+                        _multi_pass_skipped = True
+                        _multi_pass_skip_reason = "verification_error"
+                        _pass2_verify_outcome = None
                     # Fail open on anything short of a fully clean pass-2
                     # verification -- same discipline as the outer try/except
                     # around this whole block: multi_pass is an enrichment on
@@ -2481,11 +2491,19 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                     # addition-direction row silently passed through because
                     # only `ok` was checked. Only `flag is None` means pass-2
                     # was actually confirmed against a fresh reference.
-                    pass2 = (
-                        _pass2_verify_outcome["results"]
-                        if _pass2_verify_outcome["ok"] and _pass2_verify_outcome["flag"] is None
-                        else []
-                    )
+                    if (
+                        _pass2_verify_outcome is not None
+                        and _pass2_verify_outcome["ok"]
+                        and _pass2_verify_outcome["flag"] is None
+                    ):
+                        pass2 = _pass2_verify_outcome["results"]
+                    else:
+                        pass2 = []
+                        if _pass2_verify_outcome is not None:
+                            _multi_pass_skipped = True
+                            _multi_pass_skip_reason = (
+                                _pass2_verify_outcome["flag"] or "verification_rejected"
+                            )
                     pass1_ids = {r["id"] for r in results}
 
                     # Continuity gate: a pass-2 hit must contain at least
@@ -2608,6 +2626,12 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
         # sitting on top of a genuinely stale index look identical to a
         # clean, verified answer.
         result["index_verification_failed"] = True
+    if _multi_pass_skipped:
+        # This flag is deliberately separate from the primary verifier flags
+        # above. The primary result remains verified and usable; only optional
+        # pass-2 enrichment was rejected or failed.
+        result["multi_pass_skipped"] = True
+        result["multi_pass_skip_reason"] = _multi_pass_skip_reason
     return result
 
 
