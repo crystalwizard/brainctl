@@ -10649,6 +10649,46 @@ def cmd_lint(args):
             "description": f"W(m) gate may be miscalibrated (correlation={gate_cal:.2f})",
         })
 
+    # 10. Generic-agent_id memories -- catches the pre-2026-08-05-fix window where the
+    # MCP dispatcher fell straight through to "mcp-client" instead of reading
+    # BRAINCTL_AGENT_ID, and any other write that landed under a placeholder identity.
+    # Safe to auto-fix: each brain.db is single-agent by village convention (one file
+    # per agent, never shared), so every row in a given db genuinely belongs to whoever
+    # that db's real owner is -- there is no ambiguity about "whose memory is this"
+    # the way there would be in a multi-tenant store.
+    generic_ids = ("mcp-client", "default")
+    placeholders = ",".join("?" * len(generic_ids))
+    misattributed = db.execute(
+        f"SELECT COUNT(*) FROM memories WHERE agent_id IN ({placeholders})",
+        generic_ids,
+    ).fetchone()[0]
+    if misattributed:
+        current_agent = getattr(args, "agent", None)
+        can_fix = bool(current_agent) and current_agent not in generic_ids
+        issues.append({
+            "check": "generic_agent_attribution",
+            "severity": "warning",
+            "count": misattributed,
+            "description": (
+                f"{misattributed} memories are attributed to a generic identity "
+                f"({'/'.join(generic_ids)}) instead of a real agent -- almost always from "
+                f"before an agent_id resolution fix landed, not from genuine multi-agent use "
+                f"of this database."
+                + ("" if can_fix else " Pass --agent <name> to enable auto-fix for this check.")
+            ),
+        })
+        if fix and can_fix:
+            # memories.agent_id has a NOT NULL REFERENCES agents(id) constraint --
+            # reattributing to an agent who has never been separately registered
+            # would otherwise fail the UPDATE with an opaque foreign-key error.
+            _ensure_agent(db, current_agent)
+            cursor = db.execute(
+                f"UPDATE memories SET agent_id = ? WHERE agent_id IN ({placeholders})",
+                (current_agent, *generic_ids),
+            )
+            db.commit()
+            fixed += cursor.rowcount
+
     # Summary
     critical = sum(1 for i in issues if i["severity"] == "critical")
     warnings = sum(1 for i in issues if i["severity"] == "warning")

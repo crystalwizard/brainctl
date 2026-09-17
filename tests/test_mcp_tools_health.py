@@ -197,6 +197,93 @@ class TestLint:
         result = fn({"fix": False})
         assert result["ok"] is True
 
+    def _insert_generic_agent_memory(self, db_file: Path, generic_id: str = "mcp-client") -> None:
+        conn = sqlite3.connect(str(db_file))
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, display_name, agent_type, status, created_at, updated_at) "
+            f"VALUES ('{generic_id}', '{generic_id}', 'test', 'active', strftime('%Y-%m-%dT%H:%M:%S','now'), strftime('%Y-%m-%dT%H:%M:%S','now'))"
+        )
+        conn.execute(
+            "INSERT INTO memories (agent_id, content, category, scope, confidence, recalled_count, created_at, updated_at) "
+            f"VALUES ('{generic_id}', 'A fact written before agent_id resolution was fixed', 'lesson', 'agent', 0.9, 0, strftime('%Y-%m-%dT%H:%M:%S','now'), strftime('%Y-%m-%dT%H:%M:%S','now'))"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_generic_attribution_flagged(self, tmp_path, monkeypatch):
+        db_file = _init_db(tmp_path)
+        _patch_db(monkeypatch, db_file)
+        self._insert_generic_agent_memory(db_file)
+
+        result = health_mod._lint()
+
+        checks = {c["check"]: c for c in result["checks"]}
+        assert "generic_agent_attribution" in checks
+        assert checks["generic_agent_attribution"]["count"] == 1
+
+    def test_generic_attribution_not_fixed_without_agent_id(self, tmp_path, monkeypatch):
+        db_file = _init_db(tmp_path)
+        _patch_db(monkeypatch, db_file)
+        monkeypatch.delenv("BRAINCTL_AGENT_ID", raising=False)
+        self._insert_generic_agent_memory(db_file)
+
+        result = health_mod._lint(fix=True)
+
+        assert result["fixed"] == 0
+        conn = sqlite3.connect(str(db_file))
+        row = conn.execute("SELECT agent_id FROM memories WHERE agent_id != 'test-agent'").fetchone()
+        conn.close()
+        assert row is not None and row[0] == "mcp-client"
+
+    def test_generic_attribution_fixed_with_explicit_agent_id(self, tmp_path, monkeypatch):
+        db_file = _init_db(tmp_path)
+        _patch_db(monkeypatch, db_file)
+        self._insert_generic_agent_memory(db_file)
+
+        result = health_mod._lint(fix=True, agent_id="Reed")
+
+        assert result["fixed"] == 1
+        conn = sqlite3.connect(str(db_file))
+        row = conn.execute("SELECT agent_id FROM memories WHERE content LIKE 'A fact written%'").fetchone()
+        conn.close()
+        assert row[0] == "Reed"
+
+    def test_generic_attribution_fixed_via_env_var_fallback(self, tmp_path, monkeypatch):
+        db_file = _init_db(tmp_path)
+        _patch_db(monkeypatch, db_file)
+        monkeypatch.setenv("BRAINCTL_AGENT_ID", "Grok")
+        self._insert_generic_agent_memory(db_file)
+
+        result = health_mod._lint(fix=True)
+
+        assert result["fixed"] == 1
+        conn = sqlite3.connect(str(db_file))
+        row = conn.execute("SELECT agent_id FROM memories WHERE content LIKE 'A fact written%'").fetchone()
+        conn.close()
+        assert row[0] == "Grok"
+
+    def test_generic_attribution_wont_reattribute_to_another_generic_id(self, tmp_path, monkeypatch):
+        # "default" is itself in generic_ids -- must not become the "fixed" target.
+        db_file = _init_db(tmp_path)
+        _patch_db(monkeypatch, db_file)
+        self._insert_generic_agent_memory(db_file)
+
+        result = health_mod._lint(fix=True, agent_id="default")
+
+        assert result["fixed"] == 0
+        checks = {c["check"]: c for c in result["checks"]}
+        assert "Pass agent_id" in checks["generic_agent_attribution"]["description"]
+
+    def test_dispatch_lint_threads_agent_id_from_dict(self, tmp_path, monkeypatch):
+        db_file = _init_db(tmp_path)
+        _patch_db(monkeypatch, db_file)
+        self._insert_generic_agent_memory(db_file)
+
+        fn = health_mod.DISPATCH["lint"]
+        result = fn({"fix": True, "agent_id": "Ari"})
+
+        assert result["fixed"] == 1
+
 
 # ---------------------------------------------------------------------------
 # backup
