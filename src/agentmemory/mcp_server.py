@@ -4800,8 +4800,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             f"tool {name!r} is not in BRAINCTL_ALLOWED_TOOLS — "
             f"either add it to the env var or remove the call"
         )
-    # Inject agent_id from arguments or default
-    agent_id = arguments.pop("agent_id", "mcp-client")
+    # Inject agent_id from arguments, then BRAINCTL_AGENT_ID env var, then default.
+    # Ported from the 2026-08-05 production patch (see
+    # project_reed_brainctl_repair_2026-08-05.md) -- without the env-var fallback,
+    # any agent whose client doesn't pass agent_id explicitly has every memory
+    # silently misattributed to "mcp-client" instead of their own identity.
+    agent_id = arguments.pop("agent_id", os.environ.get("BRAINCTL_AGENT_ID", "mcp-client"))
 
     dispatch = {
         "memory_add": tool_memory_add,

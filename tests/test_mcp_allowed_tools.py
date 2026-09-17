@@ -224,6 +224,46 @@ class TestCallToolGating:
             pass
 
 
+class TestAgentIdEnvFallback:
+    """agent_id resolution in call_tool: explicit arg > BRAINCTL_AGENT_ID env
+    var > "mcp-client" default. Ported 2026-09-16 from a real production
+    patch (see project_reed_brainctl_repair_2026-08-05.md) after discovering
+    the live install had this fix and our fork didn't — without the env-var
+    fallback, any agent whose client doesn't pass agent_id explicitly gets
+    every memory silently misattributed to "mcp-client"."""
+
+    def _capture_agent_id(self, monkeypatch):
+        captured = {}
+
+        def _fake_tool_agent_orient(agent_id=None, **kwargs):
+            captured["agent_id"] = agent_id
+            return {"ok": True}
+
+        monkeypatch.setattr(mcp_server, "tool_agent_orient", _fake_tool_agent_orient)
+        monkeypatch.setattr(mcp_server, "_ALLOWED_TOOLS", None)
+        return captured
+
+    def test_env_var_used_when_arg_missing(self, monkeypatch):
+        captured = self._capture_agent_id(monkeypatch)
+        monkeypatch.setenv("BRAINCTL_AGENT_ID", "Reed")
+        asyncio.run(mcp_server.call_tool("agent_orient", {}))
+        assert captured["agent_id"] == "Reed"
+
+    def test_default_when_arg_and_env_both_missing(self, monkeypatch):
+        captured = self._capture_agent_id(monkeypatch)
+        monkeypatch.delenv("BRAINCTL_AGENT_ID", raising=False)
+        asyncio.run(mcp_server.call_tool("agent_orient", {}))
+        assert captured["agent_id"] == "mcp-client"
+
+    def test_explicit_arg_takes_precedence_over_env(self, monkeypatch):
+        captured = self._capture_agent_id(monkeypatch)
+        monkeypatch.setenv("BRAINCTL_AGENT_ID", "Reed")
+        asyncio.run(
+            mcp_server.call_tool("agent_orient", {"agent_id": "Grok"})
+        )
+        assert captured["agent_id"] == "Grok"
+
+
 class TestKnownToolNames:
     def test_module_exports_known_tool_set(self):
         assert hasattr(mcp_server, "_ALL_TOOL_NAMES")
