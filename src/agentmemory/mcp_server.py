@@ -374,6 +374,36 @@ _FTS_REBUILD_CHECKED_PATHS: dict = {}
 _FTS_REBUILD_CHECK_TTL_SECONDS = 300
 
 
+def _normalize_db_path_str(db_path) -> str:
+    """Real fix, 2026-09-16 (Grok's open-ended adversarial sweep of `b3bf2b2`,
+    posted as BCTL-1G): every `_FTS_REBUILD_CHECKED_PATHS` cache key was built
+    from a plain, un-normalized `str(db_path)`/f-string interpolation. On
+    Windows the SAME file can be legally spelled two different ways
+    (`F:/agentmemory/brain.db` vs `F:\\agentmemory\\brain.db`) -- a string-
+    literal cache key treats those as two unrelated files, not one. Grok
+    reproduced two real consequences: (1) if something in-process flips
+    slash style between calls, the cache splits into two entries for the
+    same physical file, causing an unnecessary extra cold-start rebuild
+    (same class as the self-touch bug fixed earlier today, different
+    trigger -- write amplification, not wrong results); (2) more serious,
+    `invalidate_fts_check_cache`'s own docstring calls it "an airtight
+    guarantee" against a real restore -- but its prefix match is also a
+    plain string comparison, so a restore tool that spells the path
+    differently than whatever's cached leaves the stale entry in place
+    entirely unnoticed, silently breaking the one guarantee this whole
+    mechanism exists to make airtight.
+
+    Fix: every site that builds or matches a cache key runs the path
+    through this single normalization first -- `os.path.normcase` folds
+    slash style and case (Windows paths are case-insensitive) to one
+    canonical form, `os.path.abspath` resolves any relative/`.`/`..`
+    segments so two spellings of the same file always produce the
+    identical string. One helper, used everywhere a path becomes part of
+    a key, rather than trusting each call site to normalize consistently
+    on its own."""
+    return os.path.normcase(os.path.abspath(str(db_path)))
+
+
 def invalidate_fts_check_cache(db_path) -> None:
     """Explicit invalidation hook (Ari's independent REV8 audit, 2026-09-11
     -- honoring the "actual caller and tested path" invalidation protocol
@@ -391,11 +421,22 @@ def invalidate_fts_check_cache(db_path) -> None:
     on nothing but "some caller told the truth about when a restore
     happened," not on any inferred filesystem signal.
 
+    R1 fix (Grok's independent sweep, 2026-09-16, BCTL-1G): the prefix
+    match here used to compare raw, un-normalized path strings -- see
+    _normalize_db_path_str's own docstring for the real failure this
+    caused (a restore tool spelling the path with different slashes than
+    whatever's cached left the stale entry untouched, defeating this
+    function's own "airtight" claim). Both the prefix and every existing
+    key are now compared through the same normalization, so slash/case
+    differences between the restorer and the searcher can no longer
+    cause a miss.
+
     No restore function exists in this codebase yet to call this from --
     documented honestly as the real, current gap, not silently assumed
     away. Safe to call even if db_path was never checked (no-op)."""
-    prefix = f"{db_path}:"
-    for key in [k for k in _FTS_REBUILD_CHECKED_PATHS if k.startswith(prefix) or k == str(db_path)]:
+    norm_path = _normalize_db_path_str(db_path)
+    prefix = f"{norm_path}:"
+    for key in [k for k in _FTS_REBUILD_CHECKED_PATHS if k.startswith(prefix) or k == norm_path]:
         del _FTS_REBUILD_CHECKED_PATHS[key]
 
 
@@ -560,15 +601,20 @@ def _cold_start_check_once(conn, db_path) -> bool:
     A failed repair no longer writes a cache entry at all, so the next
     call retries immediately rather than extending the failure's silence.
     """
+    # R1 fix (Grok's independent sweep, 2026-09-16, BCTL-1G): db_key is now
+    # built from the normalized path (see _normalize_db_path_str's own
+    # docstring) so two spellings of the same file on Windows (forward vs
+    # backward slashes) can't split into two separate cache entries.
+    _norm_db_path = _normalize_db_path_str(db_path)
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
-        db_key = f"{db_path}:instance:{instance_id}"
+        db_key = f"{_norm_db_path}:instance:{instance_id}"
     else:
         try:
             _stat = os.stat(db_path)
-            db_key = f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+            db_key = f"{_norm_db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
         except OSError:
-            db_key = str(db_path)
+            db_key = _norm_db_path
 
     try:
         _stat = os.stat(db_path)
@@ -685,15 +731,20 @@ def _resolve_fts_check_db_key(conn, db_path) -> str:
     uses, for a caller (`_refresh_fts_check_fingerprint`) that needs it AFTER
     the connection that could answer `_db_instance_id` is already closed.
     Call this BEFORE closing `conn`; pass the resulting string to the
-    refresh function AFTER closing it."""
+    refresh function AFTER closing it.
+
+    R1 fix (Grok's independent sweep, 2026-09-16, BCTL-1G): built from the
+    normalized path, same as `_cold_start_check_once` -- see
+    `_normalize_db_path_str`'s own docstring."""
+    _norm_db_path = _normalize_db_path_str(db_path)
     instance_id = _db_instance_id(conn)
     if instance_id is not None:
-        return f"{db_path}:instance:{instance_id}"
+        return f"{_norm_db_path}:instance:{instance_id}"
     try:
         _stat = os.stat(db_path)
-        return f"{db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+        return f"{_norm_db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
     except OSError:
-        return str(db_path)
+        return _norm_db_path
 
 
 def _commit_if_owned(conn, had_txn: bool) -> None:
