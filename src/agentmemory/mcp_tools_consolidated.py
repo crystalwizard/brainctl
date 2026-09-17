@@ -971,7 +971,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="agent_admin",
-        description="Agent admin ops. action ∈ {activity, list, model, ping}. Primary agent tools (agent_orient, agent_wrap_up, agent_register) stay direct.",
+        description="Agent admin ops. action ∈ {activity, list, model, ping}. Primary agent tools (agent_orient, brainctl_wrapup, agent_register) stay direct.",
         inputSchema={"type": "object", "properties": {"action": {"type": "string"}, "payload": _OBJ}, "required": ["action"]},
     ),
     Tool(
@@ -1137,6 +1137,13 @@ DEPRECATED_TOOL_NAMES: frozenset[str] = frozenset({
     "trigger_delete", "trigger_list", "trigger_update",
     "procedure_backfill", "procedure_stats", "procedure_update",
     "procedure_feedback",
+    # Not part of the v1->v2 subsystem consolidation above -- a straight
+    # rename (2026-08-10) for naming clarity. agent_wrap_up's description
+    # read as "the" session-end action; it only ever wrote brainctl's own
+    # two continuity records (session_end event + handoff packet). Renamed
+    # to brainctl_wrapup so the name itself signals brainctl-scope. Same
+    # underlying function, still fully dispatchable under the old name too.
+    "agent_wrap_up",
 })
 
 

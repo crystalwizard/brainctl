@@ -4277,12 +4277,15 @@ TOOLS = [
         },
     ),
     Tool(
-        name="agent_wrap_up",
+        name="brainctl_wrapup",
         description=(
-            "Single-call session end. Logs a session_end event AND creates a "
-            "pending handoff packet in one shot. Call at the end of every session "
-            "so the next run's agent_orient returns real context. Counterpart to "
-            "agent_orient."
+            "Writes brainctl continuity records only: one session_end event and one "
+            "pending handoff packet. This does NOT end your session, close your IDE, "
+            "or replace your own shutdown/wrap-up checklist -- it only leaves a note "
+            "so the next run's agent_orient (or a future brainctl_wrapup counterpart) "
+            "can find real context. Call it near the end of a session, alongside your "
+            "own shutdown steps, not instead of them. (Formerly named agent_wrap_up; "
+            "that name still works but is hidden from tool discovery.)"
         ),
         inputSchema={
             "type": "object",
@@ -4730,7 +4733,14 @@ try:
 except ImportError:
     _V2_DEPRECATED = frozenset()
 
-_ALL_TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOLS)
+# Union in _V2_DEPRECATED here (not just `t.name for t in TOOLS`) so that a
+# deprecated name with no surviving Tool() object (e.g. agent_wrap_up, whose
+# entry was renamed to brainctl_wrapup 2026-08-10) is still recognized as a
+# *known, deprecated* name rather than falling through to "unknown" in
+# _resolve_allowed_tools() below -- without this, any agent whose
+# BRAINCTL_ALLOWED_TOOLS still explicitly names the old tool would hard-crash
+# at startup instead of getting the intended deprecation warning/passthrough.
+_ALL_TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOLS) | _V2_DEPRECATED
 
 _VISIBLE_TOOL_NAMES: frozenset[str] = _ALL_TOOL_NAMES - _V2_DEPRECATED
 
@@ -4829,7 +4839,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         "handoff_pin": tool_handoff_pin,
         "handoff_expire": tool_handoff_expire,
         "agent_orient": tool_agent_orient,
-        "agent_wrap_up": tool_agent_wrap_up,
+        "agent_wrap_up": tool_agent_wrap_up,  # deprecated name, hidden from discovery, still dispatchable
+        "brainctl_wrapup": tool_agent_wrap_up,  # new primary name, 2026-08-10 rename
         "search": tool_search,
         "stats": tool_stats,
         "resolve_conflict": tool_resolve_conflict,

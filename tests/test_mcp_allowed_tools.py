@@ -122,14 +122,16 @@ class TestListToolsFiltering:
         this set (handoff_consume, trigger_list) live behind admin
         dispatchers and are no longer in the visible surface — call
         handoff_admin(action='consume', ...) and trigger_admin(
-        action='list', ...) instead."""
+        action='list', ...) instead. Uses brainctl_wrapup (not the
+        deprecated agent_wrap_up) — this is the actual set Reed's real
+        Antigravity config (mcp_config.json) uses."""
         antigravity_set = frozenset({
             "memory_add", "memory_search", "search", "event_add",
             "event_search", "entity_create", "entity_get", "entity_observe",
             "entity_relate", "entity_search", "decision_add", "handoff_add",
             "handoff_latest", "handoff_admin", "trigger_create",
             "trigger_admin", "trigger_check", "stats", "agent_orient",
-            "agent_wrap_up", "validate", "lint",
+            "brainctl_wrapup", "validate", "lint",
         })
         monkeypatch.setattr(mcp_server, "_ALLOWED_TOOLS", antigravity_set)
         tools = asyncio.run(mcp_server.list_tools())
@@ -270,5 +272,14 @@ class TestKnownToolNames:
         assert isinstance(mcp_server._ALL_TOOL_NAMES, frozenset)
         assert "memory_add" in mcp_server._ALL_TOOL_NAMES
         assert "stats" in mcp_server._ALL_TOOL_NAMES
-        # Should reflect the actual 201-tool surface.
-        assert len(mcp_server._ALL_TOOL_NAMES) == len(mcp_server.TOOLS)
+        # _ALL_TOOL_NAMES = every live Tool() name, UNION any deprecated name
+        # that no longer has a live Tool() object of its own (e.g.
+        # agent_wrap_up, renamed to brainctl_wrapup 2026-08-10) -- so a
+        # stale BRAINCTL_ALLOWED_TOOLS naming the old tool is recognized as
+        # known-deprecated rather than rejected as unknown. The gap between
+        # this set and the live TOOLS list should be exactly those
+        # Tool-less deprecated names, not an unrelated drift.
+        live_names = frozenset(t.name for t in mcp_server.TOOLS)
+        deprecated_without_live_tool = mcp_server._ALL_TOOL_NAMES - live_names
+        assert deprecated_without_live_tool == {"agent_wrap_up"}
+        assert mcp_server._ALL_TOOL_NAMES == live_names | mcp_server._V2_DEPRECATED
