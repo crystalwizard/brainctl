@@ -25,7 +25,7 @@ def format_context(snap: dict) -> str:
         "## brainctl session context",
         "",
         "**Session discipline:**",
-        "- Before ending this Claude Code session, call `mcp__brainctl__agent_wrap_up` with a substantive summary, goal, open loops, and next step.",
+        "- Before ending this Claude Code session, call `mcp__brainctl__brainctl_wrapup` with a substantive summary, goal, open loops, and next step.",
         "- Do not rely on the automatic SessionEnd hook for meaningful continuity; it can only synthesize shallow tool-call summaries.",
     ]
 

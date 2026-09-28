@@ -29,8 +29,11 @@ import sqlite3
 import struct
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from agentmemory.hippocampus import parse_ts
+from agentmemory.lib.mcp_helpers import now_iso
 
 
 # ----------------------------------------------------------------------------
@@ -48,8 +51,14 @@ LAST_CYCLE_KEY = "last_dream_cycle_at"
 LAST_CYCLE_AGENT = "hippocampus"
 
 
-def _now_sql() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+# THE-65 Cluster 6, Group 1: was a bare naive-local `datetime.now().strftime(...)`.
+# Aliased to the shared canonical-UTC writer (GPT's review: reuse the existing
+# helper rather than invent a second one) -- every call site below now emits
+# aware, Z-suffixed UTC instead of naive local time. Historical rows written
+# before this change stay naive-local strings on disk; hippocampus.parse_ts()
+# reads those under its documented legacy-naive-as-UTC policy, same as every
+# other reader already fixed earlier in THE-65.
+_now_sql = now_iso
 
 
 def _ensure_agent(db: sqlite3.Connection, agent_id: str) -> None:
@@ -85,26 +94,42 @@ def should_run_dream_cycle(
     ).fetchone()
     last_cycle_at = row["value"].strip('"') if row else None
 
+    # THE-65 Cluster 6, Group 1 (GPT's correction 1): `max(created_at)` picks
+    # "most recent event" by lexical string comparison, which disagrees with
+    # real insertion order once the table has mixed naive/Z-suffixed rows.
+    # `events.id` is a real AUTOINCREMENT column -- use that instead.
     last_event_row = db.execute(
-        "SELECT max(created_at) AS last FROM events"
+        "SELECT created_at FROM events ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    last_event_at = last_event_row["last"] if last_event_row else None
+    last_event_at = last_event_row["created_at"] if last_event_row else None
 
+    # THE-65 Cluster 6, Group 1: was an inline two-format naive strptime on
+    # last_event_at[:19], which silently dropped any trailing Z/offset and
+    # compared against naive-local datetime.now() -- the confirmed live bug
+    # (see tests/test_dream_cycle.py's Cluster 6 section for the full repro).
+    # parse_ts() already handles legacy-naive, Z, and explicit-offset input
+    # and always returns aware UTC; do the same for "now" so the subtraction
+    # is aware-UTC on both sides throughout.
     idle_secs: Optional[float] = None
     if last_event_at:
-        dt = None
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-            try:
-                dt = datetime.strptime(last_event_at[:19], fmt)
-                break
-            except ValueError:
-                continue
+        dt = parse_ts(last_event_at)
         if dt is not None:
-            raw = (datetime.now() - dt).total_seconds()
-            # Future-dated events (timezone skew) are clamped to 0 idle
-            # so we don't underflow into a negative-idle "always block" state.
+            raw = (datetime.now(timezone.utc) - dt).total_seconds()
+            # Future-dated events (clock skew) are clamped to 0 idle so we
+            # don't underflow into a negative-idle "always block" state.
             idle_secs = max(0.0, raw)
 
+    # THE-65 Cluster 6, Group 1 (GPT's correction 2): this remains a lexical
+    # SQL comparison. It is correct for the two forms real writers actually
+    # produce (legacy naive, canonical Z) -- see
+    # test_new_memory_trigger_mixed_naive_and_zulu_at_boundary -- but is not
+    # safe against an arbitrary explicit-offset timestamp, which no current
+    # writer emits but which parse_ts() itself would accept. Documented and
+    # tested as a known, narrow, currently-inert limitation (see
+    # test_new_memory_trigger_known_limitation_with_explicit_offset) rather
+    # than silently left unexamined or oversold as fully normalized. Fixing
+    # this for real would mean comparing parsed values in Python instead of
+    # SQL, which is a bigger change than Group 1's scope -- not done here.
     if last_cycle_at:
         new_mem_row = db.execute(
             "SELECT count(*) AS cnt FROM memories "

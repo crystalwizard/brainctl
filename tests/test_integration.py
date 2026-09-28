@@ -25,10 +25,18 @@ import agentmemory.mcp_server as mcp_server
 
 @pytest.fixture
 def mcp_db(tmp_path, monkeypatch):
-    """Return a (db_file, Brain) tuple with mcp_server.DB_PATH patched."""
+    """Return a (db_file, Brain) tuple with mcp_server.DB_PATH patched.
+
+    THE-65 contamination incident, 2026-07-13: the DB_PATH patch alone used
+    to get silently overwritten by mcp_server.get_db()'s own re-derivation
+    from the ambient BRAIN_DB env var on the very next call. _DB_PATH_LOCKED
+    tells get_db() to skip that re-derivation entirely; monkeypatch reverts
+    both attributes automatically at test teardown either way.
+    """
     db_file = tmp_path / "brain.db"
     brain = Brain(db_path=str(db_file), agent_id="test-agent")
     monkeypatch.setattr(mcp_server, "DB_PATH", db_file)
+    monkeypatch.setattr(mcp_server, "_DB_PATH_LOCKED", True)
     return db_file, brain
 
 

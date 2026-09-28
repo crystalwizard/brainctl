@@ -111,7 +111,7 @@ chat = client.chat.create(
         # full server-exposed surface (which is the 100-tool v2
         # default if you didn't set BRAINCTL_HTTP_ALLOWED_TOOLS):
         allowed_tool_names=[
-            "agent_orient", "agent_wrap_up",
+            "agent_orient", "brainctl_wrapup",
             "memory_add", "memory_search", "vsearch",
             "entity_create", "entity_search", "entity_observe",
             "decision_add", "event_add",

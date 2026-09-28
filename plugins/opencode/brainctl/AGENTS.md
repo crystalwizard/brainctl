@@ -28,7 +28,7 @@ Write as you go — don't batch at the end. The MCP tools are exposed as
   retroactively matter (triggers labile-window rescue).
 - **Search:** `memory_search`, `vsearch`, `entity_search`,
   `federated_search`.
-- **Continuity:** `agent_orient` (start), `agent_wrap_up` (end),
+- **Continuity:** `agent_orient` (start), `brainctl_wrapup` (end),
   `handoff_add` (richer mid-session handoff).
 
 ## Enums

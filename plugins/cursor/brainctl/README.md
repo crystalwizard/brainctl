@@ -96,7 +96,7 @@ Once installed, Cursor gets 196 brainctl tools including:
 | `event_add` | Append to the event stream |
 | `entity_create` / `entity_observe` / `entity_relate` | Knowledge-graph ops |
 | `handoff_latest` / `handoff_add` | Session handoffs |
-| `agent_orient` / `agent_wrap_up` | Native session bookends (new in v1.3.0) |
+| `agent_orient` / `brainctl_wrapup` | Native session bookends (new in v1.3.0) |
 | `affect_log` / `affect_check` / `affect_classify` | Affect tracking |
 | `pagerank` / `zoom_in` / `zoom_out` / `temporal_map` | Graph / temporal navigation |
 

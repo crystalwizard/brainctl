@@ -223,16 +223,33 @@ class TestAutolinkCLI:
     """Integration test: `brainctl entity autolink` CLI command."""
 
     def test_cli_autolink_returns_json(self, cli_db):
-        """The CLI command returns valid JSON with expected keys."""
+        """The CLI command returns valid JSON with expected keys.
+
+        THE-65 contamination incident, found during the 2026-07-14
+        backward-adversarial audit of the Phase 0 patch: this test's raw
+        `_i.DB_PATH = Path(cli_db)` assignment was silently overwritten by
+        _impl.get_db()'s own env-var re-derivation, the exact same bug
+        already fixed elsewhere in test_cli.py -- this file was never part
+        of the original 5 confirmed files. Fix: _DB_PATH_LOCKED = True in
+        the subprocess's inline patch code, plus explicit BRAIN_DB/cleared
+        BRAINCTL_DB/BRAINCTL_HOME in the child env, same pattern as
+        test_cli.py's run_brainctl helper. GO authorized by GPT on THE-65,
+        2026-07-14 01:35:09Z.
+        """
+        child_env = {**os.environ, "PYTHONPATH": str(SRC)}
+        child_env["BRAIN_DB"] = str(cli_db)
+        child_env.pop("BRAINCTL_DB", None)
+        child_env.pop("BRAINCTL_HOME", None)
         result = subprocess.run(
             [sys.executable, "-c",
              f"import sys; sys.path.insert(0, {str(SRC)!r}); "
              f"import agentmemory._impl as _i; from pathlib import Path; "
              f"_i.DB_PATH = Path({str(cli_db)!r}); "
+             f"_i._DB_PATH_LOCKED = True; "
              f"sys.argv = ['brainctl', 'entity', 'autolink']; "
              f"_i.main()"],
             capture_output=True, text=True, timeout=30,
-            env={**os.environ, "PYTHONPATH": str(SRC)},
+            env=child_env,
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
         data = json.loads(result.stdout)
@@ -241,16 +258,25 @@ class TestAutolinkCLI:
         assert "linked" in data
 
     def test_cli_autolink_layer_flag(self, cli_db):
-        """The --layer flag is accepted without error."""
+        """The --layer flag is accepted without error.
+
+        THE-65 contamination incident: same fix as test_cli_autolink_returns_json
+        above -- see that test's docstring for the full incident reference.
+        """
+        child_env = {**os.environ, "PYTHONPATH": str(SRC)}
+        child_env["BRAIN_DB"] = str(cli_db)
+        child_env.pop("BRAINCTL_DB", None)
+        child_env.pop("BRAINCTL_HOME", None)
         result = subprocess.run(
             [sys.executable, "-c",
              f"import sys; sys.path.insert(0, {str(SRC)!r}); "
              f"import agentmemory._impl as _i; from pathlib import Path; "
              f"_i.DB_PATH = Path({str(cli_db)!r}); "
+             f"_i._DB_PATH_LOCKED = True; "
              f"sys.argv = ['brainctl', 'entity', 'autolink', '--layer', 'fts5']; "
              f"_i.main()"],
             capture_output=True, text=True, timeout=30,
-            env={**os.environ, "PYTHONPATH": str(SRC)},
+            env=child_env,
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
         data = json.loads(result.stdout)

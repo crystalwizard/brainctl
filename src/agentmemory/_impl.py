@@ -98,6 +98,61 @@ except Exception:
 DB_PATH = get_db_path()
 BLOBS_DIR = get_blobs_dir()
 BACKUPS_DIR = get_backups_dir()
+
+# THE-65 contamination incident, 2026-07-13: set True by a test that has
+# deliberately patched DB_PATH to a temp path, so get_db() knows not to
+# re-derive it from the ambient BRAIN_DB/BRAINCTL_HOME env vars a moment
+# later. tests/conftest.py's autouse fixture resets this to False after every
+# test regardless of how the test exits -- mirrors the existing
+# _restore_module_helpers pattern for the same reason (test-order-dependent
+# leakage otherwise). Real (non-test) callers never touch this flag.
+_DB_PATH_LOCKED = False
+
+
+# THE-65 contamination incident, 2026-07-13: deliberately a hardcoded literal,
+# not derived from get_db_path()/get_brain_home() (both of which read env
+# vars). An earlier version of this guard compared the resolved DB_PATH
+# against a freshly-recomputed get_db_path() -- which is circular: a test
+# that correctly sets BRAIN_DB to its OWN tmp path gets a "resolved path" that
+# trivially equals that same freshly-recomputed value, so the guard refused
+# tests that were doing exactly the right thing (caught directly:
+# test_reranker_robustness.py's test_benchmark_cli_flag_end_to_end, which
+# sets BRAIN_DB to its own bench.db before shelling out, failed against the
+# first version of this guard). The guard's job is to recognize the one
+# specific, real, known production file on this machine, not "whatever the
+# environment currently claims" -- so it needs a fixed reference, not one
+# computed the same circular way as the bug it's guarding against.
+_KNOWN_PRODUCTION_DB_PATHS = (Path(r"F:\brain\brain.db"),)
+
+
+def _refuse_if_production_path(path: "Path") -> None:
+    """Defense-in-depth guard, THE-65: refuse to open the real, known
+    production database path while running under pytest. Independent of
+    _DB_PATH_LOCKED and of any individual test's own isolation correctness --
+    this exists specifically so a future test that reintroduces the same
+    leaky pattern (subprocess env forwarding, or an in-process patch that
+    something else clobbers) still gets caught, instead of silently writing
+    into real production data again.
+    """
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        resolved_path = path
+    matches = any(
+        resolved_path == known.resolve() if known.exists() else resolved_path == known
+        for known in _KNOWN_PRODUCTION_DB_PATHS
+    )
+    if matches:
+        raise RuntimeError(
+            f"Refusing to open {path} under pytest (PYTEST_CURRENT_TEST is set) -- "
+            "this resolves to the real production database path. If this test "
+            "genuinely needs a database, point it at a tmp_path-backed file and "
+            "set agentmemory._impl._DB_PATH_LOCKED = True before calling get_db(), "
+            "or (for subprocess-based tests) pass an env with BRAIN_DB/BRAINCTL_DB "
+            "explicitly set to that temp path. See THE-65's contamination incident "
+            "writeup (brain-db-contamination-inventory-2026-07-13.md) for why this "
+            "guard exists."
+        )
 # Single source of truth lives in agentmemory/__init__.py. Importing it here
 # means `brainctl version` can never drift out of sync with the pip metadata
 # across releases — prior versions hard-coded a string that silently rotted
@@ -855,11 +910,35 @@ def _age_str(created_at_str):
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
+    """Open (or reuse the module-level path for) the brainctl database connection.
+
+    THE-65 contamination incident, 2026-07-13: this function used to
+    unconditionally re-derive DB_PATH from the BRAIN_DB/BRAINCTL_HOME env vars
+    on *every* call whenever either was set, silently clobbering any test's
+    module-level DB_PATH patch a moment after it was applied -- the root cause
+    of real production rows being written by pytest runs on two separate
+    occasions. Root-cause fix: a test that has deliberately pinned DB_PATH now
+    sets _DB_PATH_LOCKED = True first, which this function honors by skipping
+    the env-var re-derivation entirely. See
+    brain-db-contamination-inventory-2026-07-13.md for the full incident.
+
+    Second, independent layer (defense in depth, not a substitute for the fix
+    above): refuse outright to open the real production path while running
+    under pytest, regardless of whether any given test remembered to set the
+    lock flag correctly. PYTEST_CURRENT_TEST is set by pytest itself for the
+    duration of every test (including in subprocesses that inherit the parent
+    environment), so this check is not something a future test can silently
+    forget to add.
+    """
     global DB_PATH, BLOBS_DIR, BACKUPS_DIR
-    if os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME"):
+    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
         DB_PATH = get_db_path()
         BLOBS_DIR = get_blobs_dir()
         BACKUPS_DIR = get_backups_dir()
+
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        _refuse_if_production_path(DB_PATH)
+
     if not DB_PATH.exists():
         json_out({"error": f"Database not found at {DB_PATH}",
                   "hint": "Run 'brainctl init' to create a new database, or set BRAIN_DB env var."})

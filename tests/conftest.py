@@ -72,6 +72,38 @@ def _restore_module_helpers():
             pass
 
 
+# --- THE-65 contamination incident, 2026-07-13 -----------------------------
+# _impl.get_db() and mcp_server.get_db() each unconditionally re-derived their
+# module-level DB_PATH from the ambient BRAIN_DB/BRAINCTL_HOME env vars on
+# every call whenever either was set, silently overwriting any test's DB_PATH
+# patch a moment later -- root cause of real production rows being written by
+# this test suite on two separate occasions (see
+# brain-db-contamination-inventory-2026-07-13.md). Individual tests now set
+# `_DB_PATH_LOCKED = True` alongside their own DB_PATH patch to stop that
+# re-derivation; this fixture is the safety net -- it resets both DB_PATH and
+# _DB_PATH_LOCKED back to their real, unpatched values after every single
+# test regardless of how the test exits, the same defense-in-depth reasoning
+# as _restore_module_helpers above, just for a different pair of modules and
+# a different (write-side, not read-side) bug.
+_DB_PATH_GUARDED_MODULES = ("agentmemory._impl", "agentmemory.mcp_server", "agentmemory.hippocampus")
+
+
+@pytest.fixture(autouse=True)
+def _reset_db_path_lock():
+    saved = {}
+    for mod_name in _DB_PATH_GUARDED_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        saved[mod_name] = (mod, getattr(mod, "DB_PATH", None), getattr(mod, "_DB_PATH_LOCKED", False))
+    yield
+    for mod_name, (mod, db_path, locked) in saved.items():
+        mod._DB_PATH_LOCKED = False
+        if db_path is not None:
+            mod.DB_PATH = db_path
+
+
 @pytest.fixture
 def brain(tmp_path):
     """Return a Brain instance backed by a temp DB file."""

@@ -32,7 +32,11 @@ def db_with_memories(tmp_path, monkeypatch):
     brain.remember("caching strategy for the API endpoint reduces latency", category="convention")
     brain.remember("authentication flow requires JWT token validation", category="convention")
     brain.remember("database connection pooling improves throughput", category="convention")
+    # THE-65 contamination incident, 2026-07-13: DB_PATH alone used to get
+    # silently overwritten by mcp_server.get_db()'s own re-derivation from the
+    # ambient BRAIN_DB env var. monkeypatch reverts both automatically.
     monkeypatch.setattr(ms, "DB_PATH", db_file)
+    monkeypatch.setattr(ms, "_DB_PATH_LOCKED", True)
     return db_file
 
 
@@ -90,6 +94,7 @@ class TestMultiPass:
         from agentmemory.brain import Brain
         Brain(db_path=str(db_file), agent_id="test")
         monkeypatch.setattr(ms, "DB_PATH", db_file)
+        monkeypatch.setattr(ms, "_DB_PATH_LOCKED", True)
         result = ms.tool_memory_search(
             agent_id="test",
             query="nothing here",

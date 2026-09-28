@@ -30,5 +30,5 @@ Write as you go — don't batch at the end:
 ## At session end
 
 The `SessionEnd` hook calls `Brain.wrap_up` automatically. If you want a
-richer handoff, call `mcp__brainctl__agent_wrap_up` directly with a real
+richer handoff, call `mcp__brainctl__brainctl_wrapup` directly with a real
 `summary`, `goal`, `open_loops`, and `next_step` before the hook fires.

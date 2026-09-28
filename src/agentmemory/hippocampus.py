@@ -20,8 +20,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from agentmemory.paths import get_db_path
+from agentmemory._impl import _refuse_if_production_path
 
 DB_PATH = get_db_path()
+
+# THE-65 contamination incident, 2026-07-13/14: same flag/guard pattern as
+# agentmemory._impl.get_db() and agentmemory.mcp_server.get_db() -- this
+# module has its own independent DB_PATH and get_db(), not delegating to
+# either of theirs, so it needed its own copy of the fix. Found during the
+# backward-adversarial audit of the original Phase 0 patch (2026-07-14):
+# hippocampus.py carried the identical unconditional env-var re-derivation
+# bug, unpatched, because the original 3-pass inventory scoped the
+# investigation to _impl.py/mcp_server.py only. GO for this fix authorized
+# by GPT on THE-65, 2026-07-14 01:35:09Z.
+_DB_PATH_LOCKED = False
 
 DECAY_RATES = {
     "long": 0.01,
@@ -71,9 +83,23 @@ COMPRESS_PROMPT = (
 
 
 def get_db() -> sqlite3.Connection:
+    """Open (or reuse the module-level path for) the hippocampus database connection.
+
+    THE-65 contamination incident: see agentmemory._impl.get_db()'s docstring
+    for the full incident writeup. This module's get_db() had the identical
+    unconditional-re-derivation bug, independently, and is fixed the same way:
+    a test that has deliberately pinned DB_PATH sets _DB_PATH_LOCKED = True
+    first, which this function honors by skipping the env-var re-derivation.
+    Second, independent layer: refuse outright to open the real production
+    path while running under pytest, via the shared guard in _impl.py.
+    """
     global DB_PATH
-    if os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME"):
+    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
         DB_PATH = get_db_path()
+
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        _refuse_if_production_path(DB_PATH)
+
     if not DB_PATH.exists():
         print(f"ERROR: Database not found at {DB_PATH}", file=sys.stderr)
         sys.exit(1)

@@ -111,7 +111,7 @@ These daily-use tools kept their v1 names:
 - `procedure_add`, `procedure_get`, `procedure_list`, `procedure_search`
 - `handoff_add`, `handoff_latest`
 - `trigger_create`, `trigger_check`
-- `agent_orient`, `agent_wrap_up`, `agent_register`
+- `agent_orient`, `brainctl_wrapup`, `agent_register`
 - `affect_classify`, `affect_log`, `affect_check`, `affect_monitor`
 - `reason`, `infer`, `infer_pretask`, `infer_gapfill`, `think`
 - `reconsolidate`, `reconsolidation_check`, `promote`

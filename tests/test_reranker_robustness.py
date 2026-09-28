@@ -223,7 +223,15 @@ def _call_cmd_search(db_path: Path, args: types.SimpleNamespace) -> Dict[str, An
     Mirrors tests/bench/eval._build_cmd_search_fn — same in-process patching
     of json_out so we don't need to shell out or parse stdout.
     """
+    # THE-65 contamination incident, 2026-07-13: the DB_PATH assignment above
+    # alone used to get silently overwritten by _impl.get_db()'s own
+    # re-derivation from the ambient BRAIN_DB env var on the next call --
+    # _DB_PATH_LOCKED tells it to skip that re-derivation entirely. Reset in
+    # the finally block below alongside the other module-state saves/restores
+    # already done here, so this doesn't affect any test that runs after this
+    # one in the same pytest session.
     _impl.DB_PATH = db_path
+    _impl._DB_PATH_LOCKED = True
 
     captured: List[Any] = []
     def _capture(data, compact=False):
@@ -240,6 +248,7 @@ def _call_cmd_search(db_path: Path, args: types.SimpleNamespace) -> Dict[str, An
     finally:
         _impl.json_out = saved_json
         _impl.oneline_out = saved_oneline
+        _impl._DB_PATH_LOCKED = False
         import gc
         gc.collect()
 
@@ -448,7 +457,14 @@ class TestBenchmarkFlag:
     def test_benchmark_emits_stderr_note(self, db):
         # Capture the stderr message.
         args = _build_args("alice prefers dark mode", benchmark=True)
+        # THE-65 contamination incident, 2026-07-13: this site does its own
+        # raw DB_PATH assignment (doesn't go through _call_cmd_search's
+        # already-fixed helper), so it needs the same lock flag directly --
+        # missing it here meant _impl.get_db() would silently re-derive
+        # DB_PATH from BRAIN_DB on the next call, discarding this test's own
+        # intended `db` path entirely.
         _impl.DB_PATH = db
+        _impl._DB_PATH_LOCKED = True
         captured: List[Any] = []
         def _capture(data, compact=False):
             captured.append(data)
@@ -463,6 +479,7 @@ class TestBenchmarkFlag:
             assert "raw FTS+vec ranking" in buf_err.getvalue()
         finally:
             _impl.json_out = saved_json
+            _impl._DB_PATH_LOCKED = False
 
     def test_benchmark_returns_results(self, db):
         """Sanity: --benchmark mode still returns matches, not empty."""

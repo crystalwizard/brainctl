@@ -29,6 +29,10 @@ def seeded_brain(tmp_path, monkeypatch):
     db = tmp_path / "brain.db"
     brain = Brain(db_path=str(db), agent_id="ms-agent")
     monkeypatch.setattr(mcp_server, "DB_PATH", db)
+    # THE-65 contamination incident, 2026-07-13: DB_PATH alone used to get
+    # silently overwritten by mcp_server.get_db()'s re-derivation from the
+    # ambient BRAIN_DB env var. monkeypatch reverts both automatically.
+    monkeypatch.setattr(mcp_server, "_DB_PATH_LOCKED", True)
 
     # On-topic memories (matching the original "brainctl startup FTS index"
     # query). They share the words "brainctl", "startup", "FTS", "index".

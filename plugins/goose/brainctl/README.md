@@ -15,7 +15,7 @@ HTTP port, no LLM calls.
 All 201 brainctl MCP tools available to Goose under the `brainctl__*`
 prefix. Highlights:
 
-- `brainctl__agent_orient`, `brainctl__agent_wrap_up`,
+- `brainctl__agent_orient`, `brainctl__brainctl_wrapup`,
   `brainctl__handoff_add` — session continuity
 - `brainctl__memory_add`, `brainctl__memory_search`, `brainctl__vsearch`
   — durable facts + retrieval

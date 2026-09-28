@@ -15,20 +15,41 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 
 
 def run_brainctl(*args, db_path=None, expect_ok=True):
-    """Run brainctl via subprocess, patching DB_PATH to use a temp DB."""
+    """Run brainctl via subprocess, patching DB_PATH to use a temp DB.
+
+    THE-65 contamination incident, 2026-07-13: this helper used to forward
+    the *entire* parent environment (`{**os.environ, ...}`) into the child
+    process, including the ambient BRAIN_DB env var pointing at the real
+    production database. _impl.get_db() re-derives DB_PATH from that env var
+    on every call, silently overwriting the `_i.DB_PATH = Path(...)` patch
+    set just above in the same inline script -- so every one of these
+    subprocess calls was actually writing into the real F:\\brain\\brain.db,
+    not the intended temp file. Fix: explicitly set BRAIN_DB (and clear
+    BRAINCTL_DB/BRAINCTL_HOME, which would otherwise win over it) to the
+    same temp db_path in the child's environment, so _impl.get_db()'s
+    env-var re-derivation resolves to the *correct* path instead of the real
+    one -- and set _DB_PATH_LOCKED = True as a second, independent layer so
+    the env-var re-derivation is skipped entirely regardless. See
+    brain-db-contamination-inventory-2026-07-13.md for the full incident.
+    """
     cmd_args = list(args)
     patch_code = (
         f"import sys, os; sys.path.insert(0, {str(SRC)!r}); "
         f"import agentmemory._impl as _i; "
         f"from pathlib import Path; "
         f"_i.DB_PATH = Path({str(db_path)!r}); "
+        f"_i._DB_PATH_LOCKED = True; "
         f"sys.argv = ['brainctl'] + {cmd_args!r}; "
         f"_i.main()"
     )
+    child_env = {**os.environ, "PYTHONPATH": str(SRC)}
+    child_env["BRAIN_DB"] = str(db_path)
+    child_env.pop("BRAINCTL_DB", None)
+    child_env.pop("BRAINCTL_HOME", None)
     result = subprocess.run(
         [sys.executable, "-c", patch_code],
         capture_output=True, text=True, timeout=30,
-        env={**os.environ, "PYTHONPATH": str(SRC)},
+        env=child_env,
     )
     if expect_ok:
         assert result.returncode == 0, (

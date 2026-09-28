@@ -49,7 +49,7 @@ that's already obvious from reading the code.
 
 ### On session end
 
-Call `mcp__brainctl__agent_wrap_up` with a short packet covering:
+Call `mcp__brainctl__brainctl_wrapup` with a short packet covering:
 
 - **goal**: what you were trying to accomplish
 - **current_state**: where things stand now

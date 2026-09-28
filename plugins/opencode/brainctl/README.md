@@ -10,7 +10,7 @@ plugin uses both:
 
 - **MCP** registers `brainctl-mcp` so the model has 200+ memory tools at
   its fingertips (`memory_add`, `memory_search`, `decision_add`,
-  `entity_*`, `event_add`, `agent_orient`, `agent_wrap_up`, …).
+  `entity_*`, `event_add`, `agent_orient`, `brainctl_wrapup`, …).
 - **TypeScript hooks** automatically orient at session start, log every
   tool call as an observation, and write a wrap-up handoff at session
   idle / delete — without the model having to remember to.
@@ -23,8 +23,8 @@ No long-running worker, no HTTP port, no extra LLM calls. One SQLite file.
 |----------------------|------------------------------------------------------|
 | `session.created`    | `agent_orient` snapshot, plus a `session_start` event |
 | `tool.execute.after` | `event_add` (`observation` / `error`) per tool call  |
-| `session.idle`       | `agent_wrap_up` (deduped — see below)                |
-| `session.deleted`    | `agent_wrap_up` if the idle path hadn't fired        |
+| `session.idle`       | `brainctl_wrapup` (deduped — see below)                |
+| `session.deleted`    | `brainctl_wrapup` if the idle path hadn't fired        |
 
 Plus all 200+ brainctl MCP tools available to the model directly.
 
@@ -101,8 +101,8 @@ brainctl session lifecycle:
 |----------------------|----------------------------------------------|----------------------------|
 | `session.created`    | `agent_orient` + `session_start` event       | `plugins/brainctl-orient.ts` |
 | `tool.execute.after` | `event_add` (observation / error)            | `plugins/brainctl-tool-log.ts` |
-| `session.idle`       | `agent_wrap_up` (deduped via tempfile flag)  | `plugins/brainctl-wrap-up.ts`  |
-| `session.deleted`    | `agent_wrap_up` (always, if idle hadn't run) | `plugins/brainctl-wrap-up.ts`  |
+| `session.idle`       | `brainctl_wrapup` (deduped via tempfile flag)  | `plugins/brainctl-wrap-up.ts`  |
+| `session.deleted`    | `brainctl_wrapup` (always, if idle hadn't run) | `plugins/brainctl-wrap-up.ts`  |
 
 ### Why dedupe `session.idle`?
 

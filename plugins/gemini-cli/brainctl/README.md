@@ -75,7 +75,7 @@ The `gemini-extension.json` registers `brainctl-mcp` (the canonical
 pip-installed binary) under `mcpServers.brainctl`. All 199 MCP tools then
 appear to Gemini under the `mcp__brainctl__*` prefix. Highlights:
 
-- `agent_orient`, `agent_wrap_up`, `handoff_add` — session continuity
+- `agent_orient`, `brainctl_wrapup`, `handoff_add` — session continuity
 - `memory_add`, `memory_search`, `vsearch` — durable facts + retrieval
 - `decision_add` — log non-trivial choices
 - `entity_create`, `entity_observe`, `entity_relate` — knowledge graph
@@ -119,7 +119,7 @@ from that run. Errors are logged to stderr with the prefix
   prompt logging.
 - **No LLM summarization in `wrap_up`** — the handoff is synthesized from
   structured event rows, not a Gemini call. Call
-  `mcp__brainctl__agent_wrap_up` manually with a richer `summary` if you
+  `mcp__brainctl__brainctl_wrapup` manually with a richer `summary` if you
   need it.
 - **No full tool-output capture** — `AfterTool` stores the tool name and
   a short input preview (~200 chars). Enough for forensics, not enough to

@@ -243,7 +243,7 @@ export class BrainctlService {
   }
 
   /**
-   * Single-call session end. Delegates to the native `agent_wrap_up`
+   * Single-call session end. Delegates to the native `brainctl_wrapup`
    * MCP tool which logs a `session_end` event AND creates a pending
    * handoff packet in one shot.
    */
@@ -257,7 +257,7 @@ export class BrainctlService {
     } = {},
   ) {
     return this.callTool<{ ok: boolean; event_id?: number; handoff_id?: number }>(
-      "agent_wrap_up",
+      "brainctl_wrapup",
       {
         agent_id: this.config.agentId,
         summary,

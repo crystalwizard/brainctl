@@ -15,7 +15,7 @@ mcp({ tool: "agent_orient", args: "{\"agent_id\": \"pi:<project>\", \"project\":
 mcp({ tool: "memory_add",   args: "{\"content\": \"...\", \"category\": \"project\", \"scope\": \"project:<name>\"}" })
 mcp({ tool: "decision_add", args: "{\"title\": \"...\", \"rationale\": \"...\", \"project\": \"<name>\"}" })
 mcp({ tool: "event_add",    args: "{\"summary\": \"...\", \"event_type\": \"observation\", \"importance\": 0.5}" })
-mcp({ tool: "agent_wrap_up",args: "{\"agent_id\": \"pi:<project>\", \"summary\": \"...\", \"open_loops\": \"...\", \"next_step\": \"...\"}" })
+mcp({ tool: "brainctl_wrapup",args: "{\"agent_id\": \"pi:<project>\", \"summary\": \"...\", \"open_loops\": \"...\", \"next_step\": \"...\"}" })
 ```
 
 If `directTools` is enabled in the adapter config, individual brainctl tools
@@ -28,7 +28,7 @@ Pi has no SessionStart / SessionEnd hooks bound to brainctl in v1 — orient
 and wrap_up by calling them yourself:
 
 - **Start of session:** `mcp({ tool: "agent_orient", args: "..." })` — read pending handoffs and act on open loops.
-- **End of session:** `mcp({ tool: "agent_wrap_up", args: "..." })` — log session_end + emit a handoff packet for next time.
+- **End of session:** `mcp({ tool: "brainctl_wrapup", args: "..." })` — log session_end + emit a handoff packet for next time.
 
 ## Categories & types (enums)
 

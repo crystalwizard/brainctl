@@ -28,7 +28,7 @@ it before you do substantive work so you resume with full context.
 
 ## At session end
 
-Call `brainctl__agent_wrap_up` with `agent_id`, `project`, `summary`,
+Call `brainctl__brainctl_wrapup` with `agent_id`, `project`, `summary`,
 `goal`, `open_loops`, and `next_step`. This logs a session_end event and
 creates the handoff packet the next session orients from.
 
