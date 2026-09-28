@@ -10603,6 +10603,57 @@ def cmd_lint(args):
             "description": f"W(m) gate may be miscalibrated (correlation={gate_cal:.2f})",
         })
 
+    # 10/11. Secrets lint (Cairn ideas, 2026-09-23): warn if a memory or
+    # handoff looks like it contains a token or password. Heuristic, warn
+    # severity by design -- see secrets_scan.py's module docstring for why
+    # this is a lint check, not a write-time block.
+    from agentmemory.secrets_scan import scan_for_secrets
+
+    memory_secret_hits = []
+    for row in db.execute(
+        "SELECT id, content FROM memories WHERE retired_at IS NULL"
+    ).fetchall():
+        matches = scan_for_secrets(row["content"])
+        if matches:
+            memory_secret_hits.append({
+                "id": row["id"],
+                "patterns": [m.pattern_name for m in matches],
+                "preview": [f"{m.pattern_name}={m.redacted}" for m in matches[:3]],
+            })
+    if memory_secret_hits:
+        issues.append({
+            "check": "secrets_in_memories",
+            "severity": "critical",
+            "count": len(memory_secret_hits),
+            "description": f"{len(memory_secret_hits)} memories look like they contain a credential",
+            "items": memory_secret_hits[:5],
+        })
+
+    handoff_text_cols = ("title", "goal", "current_state", "open_loops", "next_step", "recent_tail")
+    handoff_secret_hits = []
+    try:
+        for row in db.execute(
+            f"SELECT id, {', '.join(handoff_text_cols)} FROM handoff_packets"
+        ).fetchall():
+            blob = " ".join(row[c] or "" for c in handoff_text_cols)
+            matches = scan_for_secrets(blob)
+            if matches:
+                handoff_secret_hits.append({
+                    "id": row["id"],
+                    "patterns": [m.pattern_name for m in matches],
+                    "preview": [f"{m.pattern_name}={m.redacted}" for m in matches[:3]],
+                })
+    except Exception:
+        pass
+    if handoff_secret_hits:
+        issues.append({
+            "check": "secrets_in_handoffs",
+            "severity": "critical",
+            "count": len(handoff_secret_hits),
+            "description": f"{len(handoff_secret_hits)} handoff packets look like they contain a credential",
+            "items": handoff_secret_hits[:5],
+        })
+
     # Summary
     critical = sum(1 for i in issues if i["severity"] == "critical")
     warnings = sum(1 for i in issues if i["severity"] == "warning")

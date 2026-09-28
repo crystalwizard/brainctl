@@ -129,7 +129,7 @@ class TestListToolsFiltering:
             "entity_relate", "entity_search", "decision_add", "handoff_add",
             "handoff_latest", "handoff_admin", "trigger_create",
             "trigger_admin", "trigger_check", "stats", "agent_orient",
-            "agent_wrap_up", "validate", "lint",
+            "brainctl_wrapup", "validate", "lint",
         })
         monkeypatch.setattr(mcp_server, "_ALLOWED_TOOLS", antigravity_set)
         tools = asyncio.run(mcp_server.list_tools())
@@ -230,5 +230,13 @@ class TestKnownToolNames:
         assert isinstance(mcp_server._ALL_TOOL_NAMES, frozenset)
         assert "memory_add" in mcp_server._ALL_TOOL_NAMES
         assert "stats" in mcp_server._ALL_TOOL_NAMES
-        # Should reflect the actual 201-tool surface.
-        assert len(mcp_server._ALL_TOOL_NAMES) == len(mcp_server.TOOLS)
+        # _ALL_TOOL_NAMES is TOOLS plus any _V2_DEPRECATED name that has no
+        # surviving Tool() object of its own (e.g. "agent_wrap_up", renamed
+        # to "brainctl_wrapup" 2026-08-10 -- kept recognized as a known,
+        # deprecated name so an agent whose BRAINCTL_ALLOWED_TOOLS still
+        # names it gets a deprecation path instead of a hard crash at
+        # startup). So it's a superset of TOOLS, not equal in size to it.
+        tool_names = {t.name for t in mcp_server.TOOLS}
+        extra_names = mcp_server._ALL_TOOL_NAMES - tool_names
+        assert extra_names <= mcp_server._V2_DEPRECATED
+        assert mcp_server._ALL_TOOL_NAMES == tool_names | mcp_server._V2_DEPRECATED
