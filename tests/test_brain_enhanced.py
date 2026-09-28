@@ -324,6 +324,53 @@ class TestOrient:
         ctx = brain.orient()
         assert ctx["stats"]["active_memories"] >= 1
 
+    def test_orient_no_migration_warning_when_up_to_date(self, brain):
+        # A Brain()-created fixture DB has no schema_versions table at all
+        # (virgin tracker, schema already at full structure) -- same as
+        # doctor's own virgin-tracker-clean case, deliberately not warned
+        # on here (see the code comment in Brain.orient()).
+        ctx = brain.orient()
+        assert "migration_warning" not in ctx
+
+    def test_orient_warns_on_pending_migrations(self, brain):
+        # Cairn ideas, 2026-09-23: "a 'check migrations at orient' warning
+        # would catch this" -- written after Ari's DB sat 1/81 migrations
+        # behind for a while before anyone noticed. Simulate a DB that is
+        # actually behind (not a virgin tracker): first bring it under real
+        # migration tracking (applied == total, same as any real production
+        # DB), then roll back the highest-versioned row so applied < total,
+        # the same shape as a real DB that missed one migration.
+        from agentmemory import migrate as _migrate
+
+        run_result = _migrate.run(str(brain.db_path), backup=False)
+        assert run_result["ok"]
+
+        db = brain._db()
+        row = db.execute(
+            "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None, "DB should have applied migrations after migrate.run()"
+        db.execute("DELETE FROM schema_versions WHERE version = ?", (row["version"],))
+        db.commit()
+
+        ctx = brain.orient()
+        assert "migration_warning" in ctx
+        assert "1 pending migration" in ctx["migration_warning"]
+        assert "brainctl migrate" in ctx["migration_warning"]
+
+    def test_orient_migration_check_failure_does_not_break_orient(self, brain, monkeypatch):
+        # A migration-status error is not a reason to fail session start --
+        # orient() must still return normally.
+        import agentmemory.migrate as _migrate
+
+        def _boom(_db_path):
+            raise RuntimeError("simulated migrate.status() failure")
+
+        monkeypatch.setattr(_migrate, "status", _boom)
+        ctx = brain.orient()
+        assert "migration_warning" not in ctx
+        assert ctx["agent_id"] == "test-agent"
+
     def test_orient_logs_session_start(self, brain):
         brain.orient(project="test-project")
         # Check that a session_start event was logged

@@ -873,6 +873,38 @@ class Brain:
             except Exception:
                 result["stats"] = {}
 
+            # 6. Migration-state warning (Cairn ideas, 2026-09-23): "a
+            # 'check migrations at orient' warning would catch this" --
+            # written after finding Ari's DB was 1/81 migrations behind for
+            # some time before anyone noticed. Cheap check (same status
+            # call `brainctl doctor` already uses), surfaced right where an
+            # agent is already looking at session start instead of only in
+            # a diagnostic command nobody runs proactively. None of this
+            # blocks orient() from returning normally on any failure here
+            # -- a migration-check error is not a reason to fail session
+            # start.
+            try:
+                from agentmemory.migrate import status as _migrate_status
+                mig = _migrate_status(str(self.db_path))
+                applied = mig.get("applied", 0)
+                pending = mig.get("pending", 0)
+                # Only the genuinely-behind case (some migrations tracked
+                # and applied, but not all of them) warrants a warning here
+                # -- applied == 0 means an untracked/virgin schema_versions
+                # table (a DB created directly at full schema, e.g. every
+                # Brain()-created test fixture, or `brainctl init` before
+                # the migration tracker existed), not a DB that's actually
+                # behind. That virgin-tracker case needs `brainctl doctor`'s
+                # heavier ad-hoc-schema-drift heuristic to interpret safely,
+                # not a blanket warning on every orient() call.
+                if applied > 0 and pending > 0:
+                    result["migration_warning"] = (
+                        f"{pending} pending migration(s) ({applied}/"
+                        f"{mig.get('total', 0)} applied) — run `brainctl migrate`"
+                    )
+            except Exception:
+                pass
+
             # Log session start — reentrant under our RLock, uses same shared conn.
             self.log("Session started", event_type="session_start", project=project)
 
