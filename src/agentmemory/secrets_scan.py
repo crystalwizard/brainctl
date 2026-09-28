@@ -34,15 +34,27 @@ _KNOWN_PATTERNS = [
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
     ("private_key_block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
-    ("discord_bot_token", re.compile(r"\b[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}\b")),
+    ("discord_bot_token", re.compile(r"\b[MN][A-Za-z\d]{23,}\.[\w-]{6,7}\.[\w-]{27,}\b")),
 ]
 
 # Generic "label: value" phrasing -- catches the common "password: hunter2"
 # / "api_key = abc123..." shape regardless of provider. Requires the value
 # to be at least 6 chars of non-whitespace so it doesn't fire on "password:
 # (not set)" or similar placeholder text.
+#
+# The label boundary is (?:^|[\s_]) / (?=[\s_]|$) rather than \b on both
+# sides -- caught in a backward-adversarial self-review, 2026-09-28: a
+# plain \b(...)\b does NOT match "TOKEN" inside "DISCORD_BOT_TOKEN", because
+# underscore counts as a word character in regex, so there's no boundary
+# between "_" and "T". That's a real, common shape (SCREAMING_SNAKE_CASE
+# env var names) -- the original version of this pattern would have missed
+# the literal Discord bot token sitting in this machine's own primary
+# config file. Treating "_" as an additional valid separator, alongside
+# whitespace and string start/end, catches that shape without opening up
+# false positives on a label embedded mid-word without any separator
+# (e.g. "atoken:" still doesn't match).
 _GENERIC_LABEL_PATTERN = re.compile(
-    r"\b(password|passwd|api[_-]?key|secret|token|auth[_-]?token|bearer)\b"
+    r"(?:^|[\s_])(password|passwd|api[_-]?key|secret|token|auth[_-]?token|bearer)(?=[\s_:=]|$)"
     r"\s*[:=]\s*['\"]?(\S{6,})['\"]?",
     re.IGNORECASE,
 )
