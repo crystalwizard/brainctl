@@ -125,7 +125,9 @@ def test_allowlist_matches_schema_truth():
     #   id, created_at  — managed by SQLite, never updated by callers.
     #   agent_id        — ownership; changing it via update would be a
     #                      privilege-escalation path. Re-create instead.
-    intentionally_excluded = {"id", "created_at", "agent_id"}
+    #   origin          — write-path provenance (migration 087); recording it
+    #                      is the point, so update must never rewrite it.
+    intentionally_excluded = {"id", "created_at", "agent_id", "origin"}
     expected_writable = schema_cols - intentionally_excluded
 
     # Allowlist must not contain anything the schema doesn't have (would

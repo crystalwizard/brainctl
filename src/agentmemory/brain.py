@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from agentmemory.affect import classify_affect
+from agentmemory._provenance import ORIGINS, PROVENANCE_NOTICE, table_has_column
 from agentmemory.paths import get_db_path
 
 try:
@@ -695,7 +696,8 @@ class Brain:
     # ------------------------------------------------------------------
 
     def handoff(self, goal: str, current_state: str, open_loops: str, next_step: str,
-                project: Optional[str] = None, title: Optional[str] = None) -> int:
+                project: Optional[str] = None, title: Optional[str] = None,
+                origin: str = "api", source_event_id: Optional[int] = None) -> int:
         """Create a handoff packet for session continuity. Returns packet ID.
 
         Use before ending a session to preserve working context for the next agent.
@@ -704,16 +706,27 @@ class Brain:
                           ("open_loops", open_loops), ("next_step", next_step)]:
             if not val or not val.strip():
                 raise ValueError(f"{name} must be a non-empty string")
+        if origin not in ORIGINS:
+            raise ValueError(f"origin must be one of {sorted(ORIGINS)}")
         now = _now_ts()
         with self._lock:
             db = self._get_conn()
-            cur = db.execute(
-                "INSERT INTO handoff_packets (agent_id, goal, current_state, open_loops, next_step, "
-                "project, title, status, scope, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'global', ?, ?)",
-                (self.agent_id, goal, current_state, open_loops, next_step,
-                 project, title, now, now)
-            )
+            if table_has_column(db, "handoff_packets", "origin"):
+                cur = db.execute(
+                    "INSERT INTO handoff_packets (agent_id, goal, current_state, open_loops, next_step, "
+                    "project, title, status, scope, source_event_id, origin, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'global', ?, ?, ?, ?)",
+                    (self.agent_id, goal, current_state, open_loops, next_step,
+                     project, title, source_event_id, origin, now, now)
+                )
+            else:
+                cur = db.execute(
+                    "INSERT INTO handoff_packets (agent_id, goal, current_state, open_loops, next_step, "
+                    "project, title, status, scope, source_event_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'global', ?, ?, ?)",
+                    (self.agent_id, goal, current_state, open_loops, next_step,
+                     project, title, source_event_id, now, now)
+                )
             db.commit()
             return cur.lastrowid
 
@@ -759,12 +772,15 @@ class Brain:
 
             # 1. Check for pending handoff (don't consume yet — agent decides)
             try:
-                hq = "SELECT id, goal, current_state, open_loops, next_step, project, title, created_at FROM handoff_packets WHERE agent_id = ? AND status = 'pending'"
+                hcols = "id, goal, current_state, open_loops, next_step, project, title, created_at"
+                if table_has_column(db, "handoff_packets", "origin"):
+                    hcols += ", origin, source_event_id"
+                hq = f"SELECT {hcols} FROM handoff_packets WHERE agent_id = ? AND status = 'pending'"
                 hp: list[str] = [self.agent_id]
                 if project:
                     hq += " AND project = ?"
                     hp.append(project)
-                hq += " ORDER BY created_at DESC LIMIT 1"
+                hq += " ORDER BY created_at DESC, id DESC LIMIT 1"
                 hrow = db.execute(hq, hp).fetchone()
                 result["handoff"] = dict(hrow) if hrow else None
             except sqlite3.OperationalError:
@@ -791,8 +807,11 @@ class Brain:
                     (now,)
                 )
                 db.commit()
+                tcols = "id, trigger_condition, trigger_keywords, action, priority"
+                if table_has_column(db, "memory_triggers", "origin"):
+                    tcols += ", origin"
                 trows = db.execute(
-                    "SELECT id, trigger_condition, trigger_keywords, action, priority "
+                    f"SELECT {tcols} "
                     "FROM memory_triggers WHERE status = 'active' AND agent_id = ? "
                     "ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
                     "WHEN 'medium' THEN 2 ELSE 3 END",
@@ -859,6 +878,8 @@ class Brain:
                     result["procedures"] = []
             except Exception:
                 result["procedures"] = []
+
+            result["provenance_notice"] = PROVENANCE_NOTICE
 
             # 5. Quick stats
             try:
@@ -936,6 +957,8 @@ class Brain:
             open_loops=open_loops or "none noted",
             next_step=next_step or f"Continue from: {summary}",
             project=project,
+            origin="wrap_up",
+            source_event_id=event_id,
         )
         return {"event_id": event_id, "handoff_id": handoff_id}
 
@@ -958,11 +981,18 @@ class Brain:
             raise ValueError(f"priority must be one of {list(_PRIORITY_ORDER)}")
         with self._lock:
             db = self._get_conn()
-            cur = db.execute(
-                "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, "
-                "action, priority, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (self.agent_id, condition, keywords, action, priority, expires, _now_ts())
-            )
+            if table_has_column(db, "memory_triggers", "origin"):
+                cur = db.execute(
+                    "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, "
+                    "action, priority, expires_at, origin, created_at) VALUES (?, ?, ?, ?, ?, ?, 'api', ?)",
+                    (self.agent_id, condition, keywords, action, priority, expires, _now_ts())
+                )
+            else:
+                cur = db.execute(
+                    "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, "
+                    "action, priority, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (self.agent_id, condition, keywords, action, priority, expires, _now_ts())
+                )
             db.commit()
             return cur.lastrowid
 

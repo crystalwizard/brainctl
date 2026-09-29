@@ -315,6 +315,7 @@ CREATE TABLE handoff_packets (
     source_event_id INTEGER REFERENCES events(id),
     consumed_at TEXT,
     expires_at TEXT,
+    origin TEXT NOT NULL DEFAULT 'legacy',  -- write path; migration 087
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -1663,6 +1664,7 @@ CREATE TABLE memory_triggers (
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','fired','expired','cancelled')),
     fired_at TEXT,
     expires_at TEXT,
+    origin TEXT NOT NULL DEFAULT 'legacy',  -- write path; migration 087
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

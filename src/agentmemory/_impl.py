@@ -9,6 +9,7 @@ Database: $BRAIN_DB or $BRAINCTL_HOME/db/brain.db (default: ~/agentmemory/db/bra
 """
 
 import argparse
+from agentmemory._provenance import table_has_column as _table_has_column
 import hashlib as _hashlib
 import json
 import logging
@@ -2485,11 +2486,18 @@ def cmd_trigger_create(args):
             return
         entity_id = row["id"]
 
-    cur = db.execute(
-        "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, action, entity_id, memory_id, priority, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (agent_id, condition, keywords, action_text, entity_id, memory_id, priority, expires_at)
-    )
+    if _table_has_column(db, "memory_triggers", "origin"):
+        cur = db.execute(
+            "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, action, entity_id, memory_id, priority, expires_at, origin) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'cli')",
+            (agent_id, condition, keywords, action_text, entity_id, memory_id, priority, expires_at)
+        )
+    else:
+        cur = db.execute(
+            "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, action, entity_id, memory_id, priority, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (agent_id, condition, keywords, action_text, entity_id, memory_id, priority, expires_at)
+        )
     trigger_id = cur.lastrowid
     log_access(db, agent_id, "write", "memory_triggers", trigger_id)
     db.commit()
@@ -5026,14 +5034,15 @@ def cmd_handoff_add(args):
     )
     db = get_db()
     now = _now_ts()
+    _has_origin = _table_has_column(db, "handoff_packets", "origin")
     cursor = db.execute(
         """
         INSERT INTO handoff_packets (
             agent_id, session_id, chat_id, thread_id, user_id, project, scope, status,
             title, goal, current_state, open_loops, next_step, recent_tail,
             decisions_json, entities_json, tasks_json, facts_json,
-            source_event_id, expires_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_event_id, expires_at, created_at, updated_at""" + (", origin" if _has_origin else "") + """
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?""" + (", 'cli'" if _has_origin else "") + """)
         """,
         (
             validated["agent_id"],

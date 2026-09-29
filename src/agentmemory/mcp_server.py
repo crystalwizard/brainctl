@@ -34,6 +34,7 @@ from agentmemory.paths import get_db_path
 # Import the canonical surprise scorer from _impl.py — see bug-fix note
 # below at the former _surprise_score_mcp callsite.
 from agentmemory._impl import _surprise_score, _refuse_if_production_path
+from agentmemory._provenance import PROVENANCE_NOTICE, table_has_column
 logger = logging.getLogger(__name__)
 from mcp.server import Server
 
@@ -3047,11 +3048,18 @@ def tool_trigger_create(agent_id: str, condition: str, keywords: str, action: st
         if not r:
             return {"ok": False, "error": f"Entity not found: {entity}"}
         entity_id = r["id"]
-    cur = db.execute(
-        "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, action, entity_id, memory_id, priority, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (agent_id, condition, keywords, action, entity_id, memory_id, priority, expires)
-    )
+    if table_has_column(db, "memory_triggers", "origin"):
+        cur = db.execute(
+            "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, action, entity_id, memory_id, priority, expires_at, origin) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'direct')",
+            (agent_id, condition, keywords, action, entity_id, memory_id, priority, expires)
+        )
+    else:
+        cur = db.execute(
+            "INSERT INTO memory_triggers (agent_id, trigger_condition, trigger_keywords, action, entity_id, memory_id, priority, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (agent_id, condition, keywords, action, entity_id, memory_id, priority, expires)
+        )
     tid = cur.lastrowid
     log_access(db, agent_id, "write", "memory_triggers", tid)
     db.commit(); db.close()
@@ -3086,7 +3094,8 @@ def tool_trigger_check(agent_id: str, query: str) -> dict:
     prio_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     matches.sort(key=lambda t: prio_order.get(t.get("priority", "medium"), 2))
     db.commit(); db.close()
-    return {"ok": True, "query": query, "matched_triggers": matches, "count": len(matches)}
+    return {"ok": True, "query": query, "matched_triggers": matches, "count": len(matches),
+            "provenance_notice": PROVENANCE_NOTICE}
 
 
 # --- memory_triggers UPDATE: column allowlist ---------------------------------
@@ -3263,14 +3272,15 @@ def tool_handoff_add(agent_id: str, goal: str, current_state: str, open_loops: s
     db = get_db()
     ensure_agent(db, validated["agent_id"])
     now = _now_ts()
+    _has_origin = table_has_column(db, "handoff_packets", "origin")
     cursor = db.execute(
         """
         INSERT INTO handoff_packets (
             agent_id, session_id, chat_id, thread_id, user_id, project, scope, status,
             title, goal, current_state, open_loops, next_step, recent_tail,
             decisions_json, entities_json, tasks_json, facts_json,
-            source_event_id, expires_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_event_id, expires_at, created_at, updated_at""" + (", origin" if _has_origin else "") + """
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?""" + (", 'direct'" if _has_origin else "") + """)
         """,
         (
             validated["agent_id"], validated["session_id"], validated["chat_id"], validated["thread_id"], validated["user_id"], validated["project"], validated["scope"], validated["status"],
@@ -3355,7 +3365,10 @@ def tool_handoff_latest(agent_id: str, status: str | None = None, project: str =
         if row:
             break
     db.close()
-    return row_to_dict(row) or {}
+    packet = row_to_dict(row) or {}
+    if packet:
+        packet["provenance_notice"] = PROVENANCE_NOTICE
+    return packet
 
 
 def tool_handoff_consume(agent_id: str, handoff_id: int, **kw) -> dict:
