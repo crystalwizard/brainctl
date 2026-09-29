@@ -2873,7 +2873,8 @@ def tool_event_add(agent_id: str, summary: str, event_type: str, detail: str = N
     try:
         trigger_result = tool_trigger_check(agent_id, summary)
         if trigger_result.get("ok") and trigger_result.get("count", 0) > 0:
-            result["triggered"] = trigger_result["triggers"]
+            result["triggered"] = trigger_result["matched_triggers"]
+            result["provenance_notice"] = PROVENANCE_NOTICE
     except Exception:
         pass
 
@@ -3073,7 +3074,8 @@ def tool_trigger_list(agent_id: str, status: str = None) -> dict:
     else:
         rows = db.execute("SELECT * FROM memory_triggers ORDER BY created_at DESC").fetchall()
     db.close()
-    return {"ok": True, "triggers": [dict(r) for r in rows]}
+    return {"ok": True, "triggers": [dict(r) for r in rows],
+            "provenance_notice": PROVENANCE_NOTICE}
 
 
 def tool_trigger_check(agent_id: str, query: str) -> dict:

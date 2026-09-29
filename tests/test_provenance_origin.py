@@ -268,3 +268,58 @@ def test_cli_search_triggered_memories_carry_notice(tmp_path):
     out = _cli(tmp_path, "search", "banana")
     assert out["triggered_memories"][0]["origin"] == "cli"
     assert out["provenance_notice"] == PROVENANCE_NOTICE
+
+
+def test_write_handoff_refuses_wrap_up_and_legacy_without_authority(brain):
+    """Grok round 2: the private writer could be named directly. It is a speed
+    bump (in-process code can always run SQL), but 'wrap_up' now needs the
+    sentinel only Brain.wrap_up holds, and 'legacy'/'direct'/'cli' are refused."""
+    with pytest.raises(PermissionError):
+        brain._write_handoff("g", "s", "l", "n", origin="wrap_up")
+    for bad in ("legacy", "direct", "cli", "trusted"):
+        with pytest.raises(ValueError):
+            brain._write_handoff("g", "s", "l", "n", origin=bad)
+    assert brain.wrap_up("ok", next_step="n")["handoff_id"]
+
+
+def test_mcp_trigger_list_carries_notice(mcp_db):
+    mcp_server.tool_trigger_create(agent_id="test-agent", condition="c", keywords="k", action="a")
+    out = mcp_server.tool_trigger_list(agent_id="test-agent")
+    assert out["provenance_notice"] == PROVENANCE_NOTICE
+    assert out["triggers"][0]["origin"] == "direct"
+
+
+def test_event_add_surfaces_matching_trigger_with_notice(mcp_db):
+    """Pre-existing bug: event_add read trigger_result['triggers'] but trigger_check
+    returns 'matched_triggers'; the KeyError was swallowed, so nothing surfaced."""
+    mcp_server.tool_trigger_create(
+        agent_id="test-agent", condition="c", keywords="zephyrstone", action="surface the note",
+    )
+    out = mcp_server.tool_event_add(agent_id="test-agent", summary="zephyrstone happened",
+                                    event_type="observation")
+    assert out["triggered"][0]["action"] == "surface the note"
+    assert out["triggered"][0]["origin"] == "direct"
+    assert out["provenance_notice"] == PROVENANCE_NOTICE
+
+
+def test_cli_list_and_fire_carry_notice(tmp_path):
+    import os
+    import subprocess
+    env = dict(os.environ, BRAIN_DB=str(tmp_path / "cli.db"), PYTHONPATH=str(SRC))
+    subprocess.run([sys.executable, "-m", "agentmemory.cli", "init"], capture_output=True,
+                   env=env, cwd=str(tmp_path), timeout=120)
+    made = _cli(tmp_path, "trigger", "create", "when banana", "--keywords", "banana", "--action", "a")
+    _cli(tmp_path, "handoff", "add", "--goal", "g", "--current-state", "s",
+         "--open-loops", "l", "--next-step", "n")
+    import json
+    def _cli_list(*args):
+        r = subprocess.run([sys.executable, "-m", "agentmemory.cli", "-a", "cliagent", *args],
+                           capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120)
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout[r.stdout.index("["):])
+    trig = _cli_list("trigger", "list")
+    assert trig[0]["origin"] == "cli" and trig[0]["provenance_notice"]
+    hand = _cli_list("handoff", "list")
+    assert hand[0]["origin"] == "cli" and hand[0]["provenance_notice"]
+    fired = _cli(tmp_path, "trigger", "fire", str(made["trigger_id"]))
+    assert fired["provenance_notice"] == PROVENANCE_NOTICE

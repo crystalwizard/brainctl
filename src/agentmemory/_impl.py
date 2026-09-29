@@ -11,6 +11,7 @@ Database: $BRAIN_DB or $BRAINCTL_HOME/db/brain.db (default: ~/agentmemory/db/bra
 import argparse
 from agentmemory._provenance import table_has_column as _table_has_column
 from agentmemory._provenance import PROVENANCE_NOTICE as _PROVENANCE_NOTICE
+from agentmemory._provenance import PROVENANCE_NOTICE_SHORT as _PROVENANCE_NOTICE_SHORT
 import hashlib as _hashlib
 import json
 import logging
@@ -2518,7 +2519,11 @@ def cmd_trigger_list(args):
         rows = db.execute(
             "SELECT * FROM memory_triggers ORDER BY created_at DESC"
         ).fetchall()
-    json_out(rows_to_list(rows))
+    # Bare-list output is a consumer contract, so the notice rides on each item.
+    out = rows_to_list(rows)
+    for item in out:
+        item["provenance_notice"] = _PROVENANCE_NOTICE_SHORT
+    json_out(out)
 
 
 def _check_triggers(db, query_text):
@@ -2583,7 +2588,8 @@ def cmd_trigger_fire(args):
     )
     log_access(db, agent_id, "write", "memory_triggers", trigger_id)
     db.commit()
-    json_out({"ok": True, "trigger_id": trigger_id, "status": "fired", "action": row["action"]})
+    json_out({"ok": True, "trigger_id": trigger_id, "status": "fired", "action": row["action"],
+              "provenance_notice": _PROVENANCE_NOTICE})
 
 
 def cmd_trigger_cancel(args):
@@ -5099,7 +5105,10 @@ def cmd_handoff_list(args):
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(args.limit or 20)
     rows = db.execute(sql, params).fetchall()
-    json_out(rows_to_list(rows))
+    out = rows_to_list(rows)
+    for item in out:
+        item["provenance_notice"] = _PROVENANCE_NOTICE_SHORT
+    json_out(out)
 
 
 def cmd_handoff_latest(args):

@@ -42,7 +42,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from agentmemory.affect import classify_affect
 from agentmemory._provenance import (
-    ORIGINS, PROVENANCE_NOTICE, PROVENANCE_NOTICE_SHORT, table_has_column,
+    ORIGINS, PROVENANCE_NOTICE, PROVENANCE_NOTICE_SHORT, WRAP_UP_AUTHORITY,
+    table_has_column,
 )
 from agentmemory.paths import get_db_path
 
@@ -709,7 +710,8 @@ class Brain:
 
     def _write_handoff(self, goal: str, current_state: str, open_loops: str, next_step: str,
                        project: Optional[str] = None, title: Optional[str] = None,
-                       origin: str = "api", source_event_id: Optional[int] = None) -> int:
+                       origin: str = "api", source_event_id: Optional[int] = None,
+                       _authority: object = None) -> int:
         """Create a handoff packet for session continuity. Returns packet ID.
 
         Use before ending a session to preserve working context for the next agent.
@@ -718,8 +720,10 @@ class Brain:
                           ("open_loops", open_loops), ("next_step", next_step)]:
             if not val or not val.strip():
                 raise ValueError(f"{name} must be a non-empty string")
-        if origin not in ORIGINS:
-            raise ValueError(f"origin must be one of {sorted(ORIGINS)}")
+        if origin not in ("api", "wrap_up"):
+            raise ValueError("origin must be 'api' or 'wrap_up' for a Brain-written handoff")
+        if origin == "wrap_up" and _authority is not WRAP_UP_AUTHORITY:
+            raise PermissionError("origin 'wrap_up' is reserved for Brain.wrap_up()")
         now = _now_ts()
         with self._lock:
             db = self._get_conn()
@@ -972,6 +976,7 @@ class Brain:
             project=project,
             origin="wrap_up",
             source_event_id=event_id,
+            _authority=WRAP_UP_AUTHORITY,
         )
         return {"event_id": event_id, "handoff_id": handoff_id}
 
