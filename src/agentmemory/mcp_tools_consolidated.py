@@ -1146,6 +1146,19 @@ DEPRECATED_TOOL_NAMES: frozenset[str] = frozenset({
     "agent_wrap_up",
 })
 
+# Deprecated names that intentionally have no v1->v2 consolidation route:
+# they're not a subsystem being folded into a broader tool, they're a pure
+# rename kept dispatchable under the old name for backward compatibility.
+# test_every_deprecated_v1_tool_has_a_v2_route treats anything in
+# DEPRECATED_TOOL_NAMES with no route as a bug unless it's listed here.
+_ACCEPTED_HIDDEN_ORPHANS: frozenset[str] = frozenset({
+    # agent_wrap_up -> brainctl_wrapup (2026-08-10): same underlying
+    # function (tool_agent_wrap_up in mcp_server.py), reachable directly
+    # under both names via DISPATCH, not through this module's route
+    # tables -- there is no separate v2 tool for it to route to.
+    "agent_wrap_up",
+})
+
 
 def register_tools() -> tuple[list[Tool], dict[str, Any]]:
     return TOOLS, DISPATCH

@@ -72,36 +72,83 @@ def _restore_module_helpers():
             pass
 
 
-# --- THE-65 contamination incident, 2026-07-13 -----------------------------
-# _impl.get_db() and mcp_server.get_db() each unconditionally re-derived their
-# module-level DB_PATH from the ambient BRAIN_DB/BRAINCTL_HOME env vars on
-# every call whenever either was set, silently overwriting any test's DB_PATH
-# patch a moment later -- root cause of real production rows being written by
-# this test suite on two separate occasions (see
-# brain-db-contamination-inventory-2026-07-13.md). Individual tests now set
-# `_DB_PATH_LOCKED = True` alongside their own DB_PATH patch to stop that
-# re-derivation; this fixture is the safety net -- it resets both DB_PATH and
-# _DB_PATH_LOCKED back to their real, unpatched values after every single
-# test regardless of how the test exits, the same defense-in-depth reasoning
-# as _restore_module_helpers above, just for a different pair of modules and
-# a different (write-side, not read-side) bug.
-_DB_PATH_GUARDED_MODULES = ("agentmemory._impl", "agentmemory.mcp_server", "agentmemory.hippocampus")
+# --- THE-65 production-path lock, actually wired (R2-B2 fix) -------------
+# _impl.py, hippocampus.py, and mcp_server.py each carry a module-level
+# _DB_PATH_LOCKED flag, documented as "set True by a test that has patched
+# DB_PATH, reset by tests/conftest.py's autouse fixture" -- but no such
+# fixture ever existed. Ari's independent review confirmed the mechanism was
+# entirely inert: nothing outside those three modules ever set the flag.
+# This is the actual fixture that claim was describing.
+_DB_PATH_LOCK_MODULES = ("agentmemory._impl", "agentmemory.hippocampus", "agentmemory.mcp_server")
 
 
 @pytest.fixture(autouse=True)
 def _reset_db_path_lock():
-    saved = {}
-    for mod_name in _DB_PATH_GUARDED_MODULES:
+    """Defensive baseline, both before and after every test: whatever the
+    flag's state, force it back to False so one test can never leave it
+    leaked True (silently disabling another test's intended env-var
+    isolation) or leaked False (silently exposing another test's patched
+    DB_PATH to ambient env-var clobbering).
+
+    R7-B3 fix (Ari's independent REV7 audit, 2026-09-11): resetting
+    _DB_PATH_LOCKED alone isn't enough. get_db() also mutates
+    _DB_PATH_DEFAULT itself whenever it re-derives DB_PATH from the
+    environment while unlocked (the R5-B2 fix). A test that calls get_db()
+    through a real environment-only change -- exactly the natural pattern
+    the R5-B2 regression test uses -- advances that module-level sentinel
+    and leaves it advanced after the test ends, monkeypatch's own
+    setattr/setenv undo notwithstanding, since the mutation happens via
+    plain attribute assignment inside get_db(), not through monkeypatch.
+    A later test then sees DB_PATH != the *original* _DB_PATH_DEFAULT even
+    though nothing about it looks patched, and get_db()'s own
+    "DB_PATH == _DB_PATH_DEFAULT means nobody's explicitly pinned this"
+    check misfires. Snapshot and restore DB_PATH and _DB_PATH_DEFAULT here
+    too, the same defensive both-sides-of-yield shape as the lock flag."""
+    def _set_all(value):
+        for mod_name in _DB_PATH_LOCK_MODULES:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            if hasattr(mod, "_DB_PATH_LOCKED"):
+                mod._DB_PATH_LOCKED = value
+
+    saved_paths = {}
+    for mod_name in _DB_PATH_LOCK_MODULES:
         try:
             mod = importlib.import_module(mod_name)
         except Exception:
             continue
-        saved[mod_name] = (mod, getattr(mod, "DB_PATH", None), getattr(mod, "_DB_PATH_LOCKED", False))
+        saved_paths[mod_name] = {
+            "DB_PATH": getattr(mod, "DB_PATH", None),
+            "_DB_PATH_DEFAULT": getattr(mod, "_DB_PATH_DEFAULT", None),
+        }
+
+    _set_all(False)
     yield
-    for mod_name, (mod, db_path, locked) in saved.items():
-        mod._DB_PATH_LOCKED = False
-        if db_path is not None:
-            mod.DB_PATH = db_path
+    _set_all(False)
+    for mod_name, snapshot in saved_paths.items():
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        except Exception:
+            continue
+        for attr, value in snapshot.items():
+            if value is not None:
+                setattr(mod, attr, value)
+
+
+@pytest.fixture
+def locked_db_path(monkeypatch, tmp_path):
+    """The actual safe way to patch DB_PATH in-process: sets DB_PATH on all
+    three modules AND locks it, so ambient BRAIN_DB/BRAINCTL_DB/BRAINCTL_HOME
+    cannot clobber it before this test's assertions run. Automatically
+    unlocked afterward by _reset_db_path_lock. Yields the patched Path."""
+    db_file = tmp_path / "locked-brain.db"
+    for mod_name in _DB_PATH_LOCK_MODULES:
+        mod = importlib.import_module(mod_name)
+        monkeypatch.setattr(mod, "DB_PATH", db_file, raising=False)
+        monkeypatch.setattr(mod, "_DB_PATH_LOCKED", True, raising=False)
+    return db_file
 
 
 @pytest.fixture

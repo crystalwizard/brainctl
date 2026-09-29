@@ -122,7 +122,9 @@ class TestListToolsFiltering:
         this set (handoff_consume, trigger_list) live behind admin
         dispatchers and are no longer in the visible surface — call
         handoff_admin(action='consume', ...) and trigger_admin(
-        action='list', ...) instead."""
+        action='list', ...) instead. Uses brainctl_wrapup (not the
+        deprecated agent_wrap_up) — this is the actual set Reed's real
+        Antigravity config (mcp_config.json) uses."""
         antigravity_set = frozenset({
             "memory_add", "memory_search", "search", "event_add",
             "event_search", "entity_create", "entity_get", "entity_observe",
@@ -224,19 +226,60 @@ class TestCallToolGating:
             pass
 
 
+class TestAgentIdEnvFallback:
+    """agent_id resolution in call_tool: explicit arg > BRAINCTL_AGENT_ID env
+    var > "mcp-client" default. Ported 2026-09-16 from a real production
+    patch (see project_reed_brainctl_repair_2026-08-05.md) after discovering
+    the live install had this fix and our fork didn't — without the env-var
+    fallback, any agent whose client doesn't pass agent_id explicitly gets
+    every memory silently misattributed to "mcp-client"."""
+
+    def _capture_agent_id(self, monkeypatch):
+        captured = {}
+
+        def _fake_tool_agent_orient(agent_id=None, **kwargs):
+            captured["agent_id"] = agent_id
+            return {"ok": True}
+
+        monkeypatch.setattr(mcp_server, "tool_agent_orient", _fake_tool_agent_orient)
+        monkeypatch.setattr(mcp_server, "_ALLOWED_TOOLS", None)
+        return captured
+
+    def test_env_var_used_when_arg_missing(self, monkeypatch):
+        captured = self._capture_agent_id(monkeypatch)
+        monkeypatch.setenv("BRAINCTL_AGENT_ID", "Reed")
+        asyncio.run(mcp_server.call_tool("agent_orient", {}))
+        assert captured["agent_id"] == "Reed"
+
+    def test_default_when_arg_and_env_both_missing(self, monkeypatch):
+        captured = self._capture_agent_id(monkeypatch)
+        monkeypatch.delenv("BRAINCTL_AGENT_ID", raising=False)
+        asyncio.run(mcp_server.call_tool("agent_orient", {}))
+        assert captured["agent_id"] == "mcp-client"
+
+    def test_explicit_arg_takes_precedence_over_env(self, monkeypatch):
+        captured = self._capture_agent_id(monkeypatch)
+        monkeypatch.setenv("BRAINCTL_AGENT_ID", "Reed")
+        asyncio.run(
+            mcp_server.call_tool("agent_orient", {"agent_id": "Grok"})
+        )
+        assert captured["agent_id"] == "Grok"
+
+
 class TestKnownToolNames:
     def test_module_exports_known_tool_set(self):
         assert hasattr(mcp_server, "_ALL_TOOL_NAMES")
         assert isinstance(mcp_server._ALL_TOOL_NAMES, frozenset)
         assert "memory_add" in mcp_server._ALL_TOOL_NAMES
         assert "stats" in mcp_server._ALL_TOOL_NAMES
-        # _ALL_TOOL_NAMES is TOOLS plus any _V2_DEPRECATED name that has no
-        # surviving Tool() object of its own (e.g. "agent_wrap_up", renamed
-        # to "brainctl_wrapup" 2026-08-10 -- kept recognized as a known,
-        # deprecated name so an agent whose BRAINCTL_ALLOWED_TOOLS still
-        # names it gets a deprecation path instead of a hard crash at
-        # startup). So it's a superset of TOOLS, not equal in size to it.
-        tool_names = {t.name for t in mcp_server.TOOLS}
-        extra_names = mcp_server._ALL_TOOL_NAMES - tool_names
-        assert extra_names <= mcp_server._V2_DEPRECATED
-        assert mcp_server._ALL_TOOL_NAMES == tool_names | mcp_server._V2_DEPRECATED
+        # _ALL_TOOL_NAMES = every live Tool() name, UNION any deprecated name
+        # that no longer has a live Tool() object of its own (e.g.
+        # agent_wrap_up, renamed to brainctl_wrapup 2026-08-10) -- so a
+        # stale BRAINCTL_ALLOWED_TOOLS naming the old tool is recognized as
+        # known-deprecated rather than rejected as unknown. The gap between
+        # this set and the live TOOLS list should be exactly those
+        # Tool-less deprecated names, not an unrelated drift.
+        live_names = frozenset(t.name for t in mcp_server.TOOLS)
+        deprecated_without_live_tool = mcp_server._ALL_TOOL_NAMES - live_names
+        assert deprecated_without_live_tool == {"agent_wrap_up"}
+        assert mcp_server._ALL_TOOL_NAMES == live_names | mcp_server._V2_DEPRECATED

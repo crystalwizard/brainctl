@@ -35,6 +35,17 @@ DB_PATH = get_db_path()
 # by GPT on THE-65, 2026-07-14 01:35:09Z.
 _DB_PATH_LOCKED = False
 
+# R3-B3 fix (Ari's independent REV3 audit, 2026-09-10): _DB_PATH_LOCKED only
+# helps a test that remembers to set it -- every pre-existing test that
+# patches DB_PATH directly (the exact pattern that caused the original
+# contamination) got no protection at all. Snapshotting the as-imported value
+# here makes protection automatic: get_db() below only re-derives from env
+# vars when DB_PATH still equals this default, i.e. nobody has explicitly
+# pinned it yet. A direct `monkeypatch.setattr(module, "DB_PATH", ...)` -- no
+# lock flag required -- makes DB_PATH != _DB_PATH_DEFAULT and is therefore
+# self-protecting.
+_DB_PATH_DEFAULT = DB_PATH
+
 DECAY_RATES = {
     "long": 0.01,
     "medium": 0.03,
@@ -93,9 +104,24 @@ def get_db() -> sqlite3.Connection:
     Second, independent layer: refuse outright to open the real production
     path while running under pytest, via the shared guard in _impl.py.
     """
-    global DB_PATH
-    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
+    global DB_PATH, _DB_PATH_DEFAULT
+    # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
+    # gate must also recognize BRAINCTL_DB, the canonical go-forward name
+    # get_db_path() itself already checks first.
+    # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
+    # constant's definition above for why.
+    # R5-B2 fix: move _DB_PATH_DEFAULT forward with every real re-derivation
+    # -- see mcp_server.py's get_db() for the full explanation. Without this,
+    # a second legitimate environment-only change in the same process (e.g.
+    # BRAIN_DB=A then later BRAIN_DB=B) is silently ignored.
+    # R6-B1 fix: dropped the "(env vars present)" requirement -- see
+    # mcp_server.py's get_db() for the full explanation. scheduler.py's real
+    # pattern (temporarily set BRAIN_DB, call get_db(), remove it in a
+    # finally block) needs the REMOVAL to also trigger re-derivation back to
+    # the ambient default, which the presence check prevented.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT:
         DB_PATH = get_db_path()
+        _DB_PATH_DEFAULT = DB_PATH
 
     if "PYTEST_CURRENT_TEST" in os.environ:
         _refuse_if_production_path(DB_PATH)

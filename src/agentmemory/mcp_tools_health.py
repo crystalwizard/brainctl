@@ -13,6 +13,7 @@ from mcp.types import Tool
 
 from agentmemory.paths import get_db_path
 from agentmemory.lib.mcp_helpers import open_db
+from agentmemory.hippocampus import ensure_agent
 
 DB_PATH: Path = get_db_path()
 
@@ -388,7 +389,7 @@ def _health(window_days: int = 7) -> dict:
 # LINT — integrity / quality checks
 # ---------------------------------------------------------------------------
 
-def _lint(fix: bool = False) -> dict:
+def _lint(fix: bool = False, agent_id: str | None = None) -> dict:
     """Run health checks on brain.db — find issues, optionally fix some."""
     try:
         db = _db()
@@ -567,6 +568,49 @@ def _lint(fix: bool = False) -> dict:
                 })
         except Exception:
             pass
+
+        # 9. Generic-agent_id memories -- catches the pre-2026-08-05-fix window where the
+        # MCP dispatcher fell straight through to "mcp-client" instead of reading
+        # BRAINCTL_AGENT_ID, and any other write that landed under a placeholder identity.
+        # Safe to auto-fix: each brain.db is single-agent by village convention (one file
+        # per agent, never shared), so every row in a given db genuinely belongs to
+        # whoever that db's real owner is -- no ambiguity about whose memory it is.
+        generic_ids = ("mcp-client", "default")
+        placeholders = ",".join("?" * len(generic_ids))
+        misattributed = db.execute(
+            f"SELECT COUNT(*) FROM memories WHERE agent_id IN ({placeholders})",  # nosec B608 - placeholders is a fixed-length "?,?" string, values fully parameterized
+            generic_ids,
+        ).fetchone()[0]
+        if misattributed:
+            # Explicit agent_id argument wins; otherwise fall back to this server
+            # process's own configured identity, same resolution order as call_tool's
+            # own agent_id handling.
+            current_agent = agent_id or os.environ.get("BRAINCTL_AGENT_ID")
+            can_fix = bool(current_agent) and current_agent not in generic_ids
+            issues.append({
+                "check": "generic_agent_attribution",
+                "severity": "warning",
+                "count": misattributed,
+                "description": (
+                    f"{misattributed} memories are attributed to a generic identity "
+                    f"({'/'.join(generic_ids)}) instead of a real agent -- almost always from "
+                    f"before an agent_id resolution fix landed, not from genuine multi-agent "
+                    f"use of this database."
+                    + ("" if can_fix else " Pass agent_id to enable auto-fix for this check.")
+                ),
+            })
+            if fix and can_fix:
+                # memories.agent_id has a NOT NULL REFERENCES agents(id) constraint --
+                # reattributing to an agent who's never been separately registered
+                # (agent_register/ensure_agent) would otherwise fail the UPDATE with an
+                # opaque foreign-key error instead of just fixing the data.
+                ensure_agent(db, current_agent)
+                cursor = db.execute(
+                    f"UPDATE memories SET agent_id = ? WHERE agent_id IN ({placeholders})",  # nosec B608 - same fixed placeholders as the SELECT above
+                    (current_agent, *generic_ids),
+                )
+                db.commit()
+                fixed += cursor.rowcount
 
         db.close()
 
@@ -758,7 +802,8 @@ def _call_health(args: dict) -> dict:
 
 def _call_lint(args: dict) -> dict:
     fix = bool(args.get("fix", False))
-    return _lint(fix=fix)
+    agent_id = args.get("agent_id")
+    return _lint(fix=fix, agent_id=agent_id)
 
 
 def _call_backup(args: dict) -> dict:
@@ -811,7 +856,9 @@ TOOLS: list[Tool] = [
         description=(
             "Run quality lint checks on brain.db: low-confidence memories, never-recalled memories, "
             "orphan entities, knowledge gaps, duplicate entity names, stale affect data, access log bloat, "
-            "and DB size. Optionally auto-fix safe issues."
+            "DB size, and memories attributed to a generic identity (mcp-client/default) instead of a "
+            "real agent. Optionally auto-fix safe issues -- the generic-attribution fix requires your "
+            "own agent_id (passed explicitly, or resolved from this session's own identity)."
         ),
         inputSchema={
             "type": "object",

@@ -108,6 +108,17 @@ BACKUPS_DIR = get_backups_dir()
 # leakage otherwise). Real (non-test) callers never touch this flag.
 _DB_PATH_LOCKED = False
 
+# R3-B3 fix (Ari's independent REV3 audit, 2026-09-10): _DB_PATH_LOCKED only
+# helps a test that remembers to set it -- every pre-existing test that
+# patches DB_PATH directly (the exact pattern that caused the original
+# contamination) got no protection at all. Snapshotting the as-imported value
+# here makes protection automatic: get_db() below only re-derives from env
+# vars when DB_PATH still equals this default, i.e. nobody has explicitly
+# pinned it yet. A direct `monkeypatch.setattr(module, "DB_PATH", ...)` -- no
+# lock flag required -- makes DB_PATH != _DB_PATH_DEFAULT and is therefore
+# self-protecting.
+_DB_PATH_DEFAULT = DB_PATH
+
 
 # THE-65 contamination incident, 2026-07-13: deliberately a hardcoded literal,
 # not derived from get_db_path()/get_brain_home() (both of which read env
@@ -930,9 +941,25 @@ def get_db() -> sqlite3.Connection:
     environment), so this check is not something a future test can silently
     forget to add.
     """
-    global DB_PATH, BLOBS_DIR, BACKUPS_DIR
-    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
+    global DB_PATH, BLOBS_DIR, BACKUPS_DIR, _DB_PATH_DEFAULT
+    # R2-B2 fix: get_db_path() itself checks BRAINCTL_DB first (the canonical
+    # go-forward name), but this gate only checked whether BRAIN_DB/BRAINCTL_HOME
+    # were set to decide whether to bother calling it -- a caller setting only
+    # BRAINCTL_DB was silently ignored, since the gate never fired at all.
+    # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
+    # constant's definition above for why.
+    # R5-B2 fix: move _DB_PATH_DEFAULT forward with every real re-derivation
+    # -- see mcp_server.py's get_db() for the full explanation. Without this,
+    # a second legitimate environment-only change in the same process (e.g.
+    # BRAIN_DB=A then later BRAIN_DB=B) is silently ignored.
+    # R6-B1 fix: dropped the "(env vars present)" requirement -- see
+    # mcp_server.py's get_db() for the full explanation. scheduler.py's real
+    # pattern (temporarily set BRAIN_DB, call get_db(), remove it in a
+    # finally block) needs the REMOVAL to also trigger re-derivation back to
+    # the ambient default, which the presence check prevented.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT:
         DB_PATH = get_db_path()
+        _DB_PATH_DEFAULT = DB_PATH
         BLOBS_DIR = get_blobs_dir()
         BACKUPS_DIR = get_backups_dir()
 
@@ -3192,7 +3219,7 @@ def cmd_memory_add(args):
                 candidates = db.execute(
                     "SELECT m.id, m.content, m.confidence, m.category, m.recalled_count "
                     "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                    "WHERE memories_fts MATCH ? AND m.agent_id = ? AND m.retired_at IS NULL "
+                    "WHERE memories_fts MATCH ? AND m.agent_id = ? AND m.retired_at IS NULL AND m.indexed = 1 "
                     "AND m.category = ? "
                     "ORDER BY f.rank LIMIT 5",
                     (fts_q, args.agent, args.category)
@@ -3493,7 +3520,7 @@ def cmd_memory_search(args):
 
     if args.exact:
         rows = db.execute(
-            "SELECT * FROM memories WHERE retired_at IS NULL AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
+            "SELECT * FROM memories WHERE retired_at IS NULL AND indexed = 1 AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
             (f"%{query}%", limit * 5 if not no_recency else limit)
         ).fetchall()
         results = rows_to_list(rows)
@@ -3527,7 +3554,7 @@ def cmd_memory_search(args):
             rows = db.execute(
                 f"SELECT m.*, {_BM25_MEMORIES_EXPR} as fts_rank "
                 "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL "
+                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 "
                 f"ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
                 (fts_query, fetch_limit)
             ).fetchall()
@@ -5888,7 +5915,7 @@ def _surprise_score(db, content: str, blob=None):
             return 0.5, "fts5_no_query_neutral"
         rows = db.execute(
             "SELECT m.content FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL ORDER BY rank LIMIT 5",
+            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 ORDER BY rank LIMIT 5",
             (fts_query,)
         ).fetchall()
         if not rows:
@@ -6479,7 +6506,7 @@ def cmd_search(args, *, db=None, db_path: Optional[str] = None):
             "m.encoding_task_context, m.encoding_context_hash, m.q_value, m.confidence_phase, "
             "m.trust_score, m.replay_priority "
             "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL "
+            "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 "
             "AND COALESCE(m.memory_type, 'episodic') != 'procedural' "
             "ORDER BY bm25(memories_fts, 3.0, 1.0, 1.0) LIMIT ?",
             (fts_query, fetch_limit)
@@ -9799,6 +9826,25 @@ def cmd_init(args):
         tables = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()]
+        # Seed the external-content FTS5 inverted index (issue #151). A fresh
+        # memories_fts starts empty; without this rebuild the index is never
+        # primed, and subsequent adds + searches on the CLI path return
+        # nothing until a manual rebuild.
+        try:
+            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            # B3: rebuild re-imports every memories row regardless of
+            # indexed/retired_at; purge anything ineligible right back out.
+            # Normally a no-op on a genuinely fresh DB, kept for defense in
+            # depth if init is ever pointed at a non-empty target.
+            conn.execute(
+                "INSERT INTO memories_fts(memories_fts, rowid, content, category, tags) "
+                "SELECT 'delete', m.id, m.content, m.category, m.tags "
+                "FROM memories m JOIN memories_fts_docsize d ON d.rowid = m.id "
+                "WHERE NOT (m.indexed = 1 AND m.retired_at IS NULL)"
+            )
+            conn.commit()
+        except sqlite3.Error:
+            pass  # memories_fts may be absent in a minimal/partial schema
         conn.close()
 
         json_out({
@@ -10195,7 +10241,7 @@ def cmd_report(args):
 
     # --- Memories ---
     h2("Key Memories")
-    mem_sql = "SELECT id, category, content, confidence, created_at FROM memories WHERE retired_at IS NULL"
+    mem_sql = "SELECT id, category, content, confidence, created_at FROM memories WHERE retired_at IS NULL AND indexed = 1"
     mem_params = []
     if topic:
         mem_sql += " AND (content LIKE ? OR category LIKE ?)"
@@ -10395,7 +10441,7 @@ def _report_entity(db, name, lines, h2, h3, p, bullet, blank, limit):
     # Related memories (by name mention)
     related_mems = db.execute(
         "SELECT content, confidence, created_at FROM memories "
-        "WHERE retired_at IS NULL AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
+        "WHERE retired_at IS NULL AND indexed = 1 AND content LIKE ? ORDER BY confidence DESC LIMIT ?",
         (f"%{ent['name']}%", limit)
     ).fetchall()
     if related_mems:
@@ -10603,7 +10649,7 @@ def cmd_lint(args):
             "description": f"W(m) gate may be miscalibrated (correlation={gate_cal:.2f})",
         })
 
-    # 10/11. Secrets lint (Cairn ideas, 2026-09-23): warn if a memory or
+    # 10. Secrets lint (Cairn ideas, 2026-09-23): warn if a memory or
     # handoff looks like it contains a token or password. Heuristic, warn
     # severity by design -- see secrets_scan.py's module docstring for why
     # this is a lint check, not a write-time block.
@@ -10653,6 +10699,46 @@ def cmd_lint(args):
             "description": f"{len(handoff_secret_hits)} handoff packets look like they contain a credential",
             "items": handoff_secret_hits[:5],
         })
+
+    # 11. Generic-agent_id memories -- catches the pre-2026-08-05-fix window where the
+    # MCP dispatcher fell straight through to "mcp-client" instead of reading
+    # BRAINCTL_AGENT_ID, and any other write that landed under a placeholder identity.
+    # Safe to auto-fix: each brain.db is single-agent by village convention (one file
+    # per agent, never shared), so every row in a given db genuinely belongs to whoever
+    # that db's real owner is -- there is no ambiguity about "whose memory is this"
+    # the way there would be in a multi-tenant store.
+    generic_ids = ("mcp-client", "default")
+    placeholders = ",".join("?" * len(generic_ids))
+    misattributed = db.execute(
+        f"SELECT COUNT(*) FROM memories WHERE agent_id IN ({placeholders})",
+        generic_ids,
+    ).fetchone()[0]
+    if misattributed:
+        current_agent = getattr(args, "agent", None)
+        can_fix = bool(current_agent) and current_agent not in generic_ids
+        issues.append({
+            "check": "generic_agent_attribution",
+            "severity": "warning",
+            "count": misattributed,
+            "description": (
+                f"{misattributed} memories are attributed to a generic identity "
+                f"({'/'.join(generic_ids)}) instead of a real agent -- almost always from "
+                f"before an agent_id resolution fix landed, not from genuine multi-agent use "
+                f"of this database."
+                + ("" if can_fix else " Pass --agent <name> to enable auto-fix for this check.")
+            ),
+        })
+        if fix and can_fix:
+            # memories.agent_id has a NOT NULL REFERENCES agents(id) constraint --
+            # reattributing to an agent who has never been separately registered
+            # would otherwise fail the UPDATE with an opaque foreign-key error.
+            _ensure_agent(db, current_agent)
+            cursor = db.execute(
+                f"UPDATE memories SET agent_id = ? WHERE agent_id IN ({placeholders})",
+                (current_agent, *generic_ids),
+            )
+            db.commit()
+            fixed += cursor.rowcount
 
     # Summary
     critical = sum(1 for i in issues if i["severity"] == "critical")
@@ -14210,7 +14296,7 @@ def cmd_push(args):
         rows = db.execute(
             f"SELECT m.id, 'memory' as type, m.category, m.content, m.confidence, m.scope, m.created_at, {_BM25_MEMORIES_EXPR} as fts_rank "
             "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
+            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
             (fts_query, fetch_limit)
         ).fetchall()
         return rows_to_list(rows)
@@ -16009,7 +16095,7 @@ def _reason_l1_search(db, query: str, limit: int = 10):
         rows = db.execute(
             f"SELECT m.id, 'memory' as type, m.category, m.content, m.confidence, m.scope, m.created_at, {_BM25_MEMORIES_EXPR} as fts_rank "
             "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
+            f"WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
             (fts_query, fetch_limit)
         ).fetchall()
         fts_mems = rows_to_list(rows)
@@ -16405,7 +16491,7 @@ def cmd_infer_pretask(args):
         try:
             mem_rows = db.execute(
                 "SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.confidence < 0.7 "
+                "WHERE memories_fts MATCH ? AND m.retired_at IS NULL AND m.indexed = 1 AND m.confidence < 0.7 "
                 f"ORDER BY {_BM25_MEMORIES_EXPR} LIMIT ?",
                 (fts_q, limit * 3)
             ).fetchall()

@@ -29,7 +29,7 @@ def test_format_context_always_injects_wrap_up_discipline():
     text = module.format_context({})
 
     assert "Before ending this Claude Code session" in text
-    assert "mcp__brainctl__agent_wrap_up" in text
+    assert "mcp__brainctl__brainctl_wrapup" in text
     assert "Do not rely on the automatic SessionEnd hook" in text
 
 
@@ -50,4 +50,4 @@ def test_format_context_preserves_orient_snapshot_sections():
     assert "[warning] auto wrap-up stale" in text
     assert "[lesson] Manual wrap_up beats hook summaries." in text
     assert "3 memories, 4 events, 5 entities" in text
-    assert "mcp__brainctl__agent_wrap_up" in text
+    assert "mcp__brainctl__brainctl_wrapup" in text

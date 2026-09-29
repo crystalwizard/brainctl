@@ -20,8 +20,10 @@ import re
 import sqlite3
 import struct
 import sys
+import time
 import urllib.request
 import urllib.error
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -237,6 +239,17 @@ DB_PATH = get_db_path()
 # brain-db-contamination-inventory-2026-07-13.md for the full incident.
 _DB_PATH_LOCKED = False
 
+# R3-B3 fix (Ari's independent REV3 audit, 2026-09-10): _DB_PATH_LOCKED only
+# helps a test that remembers to set it -- every pre-existing test that
+# patches DB_PATH directly (the exact pattern that caused the original
+# contamination) got no protection at all. Snapshotting the as-imported value
+# here makes protection automatic: get_db() below only re-derives from env
+# vars when DB_PATH still equals this default, i.e. nobody has explicitly
+# pinned it yet. A direct `monkeypatch.setattr(module, "DB_PATH", ...)` -- no
+# lock flag required -- makes DB_PATH != _DB_PATH_DEFAULT and is therefore
+# self-protecting.
+_DB_PATH_DEFAULT = DB_PATH
+
 
 def _find_vec_dylib():
     """Auto-discover the sqlite-vec loadable extension path."""
@@ -284,9 +297,38 @@ _now_ts = now_iso
 
 
 def get_db() -> sqlite3.Connection:
-    global DB_PATH
-    if not _DB_PATH_LOCKED and (os.environ.get("BRAIN_DB") or os.environ.get("BRAINCTL_HOME")):
+    global DB_PATH, _DB_PATH_DEFAULT
+    # R2-B2 fix: see _impl.py's get_db() for the full explanation -- this
+    # gate must also recognize BRAINCTL_DB, the canonical go-forward name
+    # get_db_path() itself already checks first.
+    # R3-B3 fix: also require DB_PATH == _DB_PATH_DEFAULT -- see that
+    # constant's definition above for why.
+    # R5-B2 fix (Ari's independent REV5 audit, 2026-09-10): _DB_PATH_DEFAULT
+    # must move forward every time re-derivation actually happens, or a
+    # SECOND legitimate environment-only change (BRAIN_DB=A, then later
+    # BRAIN_DB=B, same process) gets silently ignored -- DB_PATH is now A,
+    # which no longer equals the original import-time default, so the gate
+    # looks identical to "someone explicitly pinned it" even though nobody
+    # did. Moving the default forward in lockstep with real re-derivations
+    # keeps that chain alive, while an external monkeypatch.setattr (which
+    # never goes through this line) still breaks it and stays protected.
+    # R6-B1 fix (Ari's independent REV6 audit, 2026-09-10): gating
+    # re-derivation behind "one of these three vars is CURRENTLY set" broke
+    # the reverse transition -- scheduler.py's real pattern is to temporarily
+    # set BRAIN_DB, call get_db(), then REMOVE it in a finally block,
+    # expecting the next call to fall back to the ambient default. With the
+    # env-presence check, removing the var meant the gate's "(env vars)"
+    # clause went False too, so DB_PATH stayed pinned to the temporary path
+    # forever. get_db_path() already correctly computes the right path
+    # whether or not any of these vars are set (falling back to the real
+    # default), so the presence check was never actually protecting
+    # anything -- dropping it and relying solely on the DB_PATH==default
+    # check (which already distinguishes "nobody's pinned this" from "an
+    # explicit patch happened") is what makes both directions -- var set,
+    # and var removed -- re-derive correctly.
+    if not _DB_PATH_LOCKED and DB_PATH == _DB_PATH_DEFAULT:
         DB_PATH = get_db_path()
+        _DB_PATH_DEFAULT = DB_PATH
 
     if "PYTEST_CURRENT_TEST" in os.environ:
         _refuse_if_production_path(DB_PATH)
@@ -307,11 +349,417 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-_FTS_REBUILD_CHECKED = False
+# F7 fix, 2026-09-10: was a single global bool, so a healthy first database
+# in a process permanently skipped the check for every other database opened
+# afterward in the same process. Keyed by resolved db path instead, so each
+# distinct database gets its own one-time check.
+#
+# R5-B1 fix (Ari's independent REV5 audit, 2026-09-10): "once per instance,
+# forever" is unfixable in principle for this key, because a restored backup
+# or a cloned file is BY DEFINITION carrying forward the same stamp as
+# whatever was true when it was last checked -- no passive signal (stamped
+# UUID included) can distinguish "still the same live database" from "an old
+# snapshot of it, restored later," since those really are byte-identical.
+# Ari proved this directly: stamp+cache a disposable db, then place a second,
+# genuinely different db carrying that same stamp at the same path -- a real
+# tool_memory_search still skipped repair. Bounding the cache with a TTL
+# caps the worst-case staleness window instead of chasing a perfect identity
+# signal that can't exist.
+#
+# R8 fix (Ari's independent REV8 audit, 2026-09-11): values are now
+# `(time.monotonic() timestamp, (mtime_ns, size) or None)` tuples, not bare
+# timestamps -- see _cold_start_check_once's own docstring for why the file
+# fingerprint half exists. `.clear()` still works the same for existing tests.
+_FTS_REBUILD_CHECKED_PATHS: dict = {}
+_FTS_REBUILD_CHECK_TTL_SECONDS = 300
+
+
+def _normalize_db_path_str(db_path) -> str:
+    """Real fix, 2026-09-16 (Grok's open-ended adversarial sweep of `b3bf2b2`,
+    posted as BCTL-1G): every `_FTS_REBUILD_CHECKED_PATHS` cache key was built
+    from a plain, un-normalized `str(db_path)`/f-string interpolation. On
+    Windows the SAME file can be legally spelled two different ways
+    (`F:/agentmemory/brain.db` vs `F:\\agentmemory\\brain.db`) -- a string-
+    literal cache key treats those as two unrelated files, not one. Grok
+    reproduced two real consequences: (1) if something in-process flips
+    slash style between calls, the cache splits into two entries for the
+    same physical file, causing an unnecessary extra cold-start rebuild
+    (same class as the self-touch bug fixed earlier today, different
+    trigger -- write amplification, not wrong results); (2) more serious,
+    `invalidate_fts_check_cache`'s own docstring calls it "an airtight
+    guarantee" against a real restore -- but its prefix match is also a
+    plain string comparison, so a restore tool that spells the path
+    differently than whatever's cached leaves the stale entry in place
+    entirely unnoticed, silently breaking the one guarantee this whole
+    mechanism exists to make airtight.
+
+    Fix: every site that builds or matches a cache key runs the path
+    through this single normalization first -- `os.path.normcase` folds
+    slash style and case (Windows paths are case-insensitive) to one
+    canonical form, `os.path.abspath` resolves any relative/`.`/`..`
+    segments so two spellings of the same file always produce the
+    identical string. One helper, used everywhere a path becomes part of
+    a key, rather than trusting each call site to normalize consistently
+    on its own."""
+    return os.path.normcase(os.path.abspath(str(db_path)))
+
+
+def invalidate_fts_check_cache(db_path) -> None:
+    """Explicit invalidation hook (Ari's independent REV8 audit, 2026-09-11
+    -- honoring the "actual caller and tested path" invalidation protocol
+    his R7-B1 report asked for, rather than chasing a passive signal that
+    can't be made airtight on this schema/filesystem -- see the measured
+    reasoning in _cold_start_check_once's own docstring).
+
+    Any code path that replaces a brain.db file wholesale IN this process
+    (a restore command, a backup-restore script, a migration tool) should
+    call this as its last step, with the SAME db_path passed to
+    _cold_start_check_once elsewhere. It forces the next call for that
+    path to run a full check unconditionally, regardless of the cached
+    instance stamp, file fingerprint, or TTL -- an airtight guarantee the
+    passive mtime/size layer cannot promise on its own, since it depends
+    on nothing but "some caller told the truth about when a restore
+    happened," not on any inferred filesystem signal.
+
+    R1 fix (Grok's independent sweep, 2026-09-16, BCTL-1G): the prefix
+    match here used to compare raw, un-normalized path strings -- see
+    _normalize_db_path_str's own docstring for the real failure this
+    caused (a restore tool spelling the path with different slashes than
+    whatever's cached left the stale entry untouched, defeating this
+    function's own "airtight" claim). Both the prefix and every existing
+    key are now compared through the same normalization, so slash/case
+    differences between the restorer and the searcher can no longer
+    cause a miss.
+
+    No restore function exists in this codebase yet to call this from --
+    documented honestly as the real, current gap, not silently assumed
+    away. Safe to call even if db_path was never checked (no-op)."""
+    norm_path = _normalize_db_path_str(db_path)
+    prefix = f"{norm_path}:"
+    for key in [k for k in _FTS_REBUILD_CHECKED_PATHS if k.startswith(prefix) or k == norm_path]:
+        del _FTS_REBUILD_CHECKED_PATHS[key]
+
+
+def _db_instance_id(conn) -> str | None:
+    """R3-B1 fix (Ari's independent REV3 audit, 2026-09-10): mtime+size is not
+    a database identity -- confirmed by direct measurement to collide on a
+    same-size replacement landing in the same filesystem mtime-granularity
+    bucket, and independently reproduced by Ari with a controlled same-size,
+    restored-timestamp replacement. Neither mtime, size, nor inode (Windows
+    reuses freed inodes quickly) can be trusted.
+
+    A value stamped INTO the database file itself, the first time this
+    process ever looks at it, has none of those problems: a genuinely new or
+    replaced file (created via connect()+executescript(), not a byte-for-byte
+    copy of the old one) simply won't have this row yet, so it gets a fresh
+    random id -- no coincidence in filesystem metadata can produce a
+    collision. `workspace_config` is an existing generic key-value table in
+    the schema, so this needs no migration. Returns None (never "no repair
+    needed") if the table doesn't exist yet (schema not initialized, or a
+    pre-workspace_config database) -- callers must treat that as "always
+    check," not as a stable identity of its own.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM workspace_config WHERE key = '_db_instance_id'"
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        new_id = uuid.uuid4().hex
+        had_txn = getattr(conn, "in_transaction", False)
+        conn.execute(
+            "INSERT INTO workspace_config (key, value) VALUES ('_db_instance_id', ?)",
+            (new_id,),
+        )
+        _commit_if_owned(conn, had_txn)
+        return new_id
+    except sqlite3.Error:
+        return None
+
+
+def _cold_start_check_once(conn, db_path) -> bool:
+    """Run _ensure_fts_index_consistent at most once per (path, database
+    instance) per TTL window. Pulled out of memory_search's body into its own
+    callable unit (2026-09-10) specifically so it can be unit tested directly
+    -- Ari's REV2 review caught that the original F7 test never touched this
+    real guard at all, only a throwaway local set built for the test itself.
+
+    R3-B1 fix: keys on the stamped `_db_instance_id` (see that function)
+    rather than filesystem metadata, so a same-path replacement is detected
+    regardless of mtime granularity or size collisions. Falls back to
+    mtime+size only when the database predates `workspace_config` or the
+    table read/write itself fails -- a narrower, honestly-labeled residual
+    gap than the old mtime+size-only scheme, and never silently treated as
+    "unchanged" for a database that *can* be stamped.
+
+    R5-B1 fix: the stamp alone isn't enough -- a restored backup or cloned
+    file carries the SAME stamp forward, since it's the same bytes. No
+    passive signal can tell "still the same live database" apart from "an
+    old snapshot of it, restored later." _FTS_REBUILD_CHECK_TTL_SECONDS
+    bounds the resulting staleness: even a stamp collision self-heals within
+    that window instead of being trusted forever.
+
+    R6-B2 fix (Ari's independent REV6 audit, 2026-09-10): a bounded staleness
+    window is still a silent correctness gap -- a database restored with a
+    wiped/underpopulated FTS index (the exact scenario R5-B1 and R3-B1 exist
+    for) could return zero results for real, eligible content for up to
+    _FTS_REBUILD_CHECK_TTL_SECONDS, with no signal to the caller that
+    anything is wrong. A cheap per-call fingerprint comparison between
+    eligible memories and indexed FTS docs, run on every call regardless of
+    the stamp/TTL bookkeeping, catches the severe, common restore case
+    immediately rather than eventually.
+
+    R7-B1 fix (Ari's independent REV7 audit, 2026-09-11): a plain COUNT(*)
+    comparison is not that fingerprint -- it only catches a SIZE mismatch.
+    Ari proved a same-stamp restore whose replacement content happens to
+    leave eligible and indexed COUNTS equal (wrong membership, right size)
+    sails through untouched and stays silently wrong for the full TTL
+    window. Comparing (COUNT, SUM(id)) instead of COUNT alone is still one
+    cheap index-backed aggregate query per side -- no real cost increase --
+    but two different id sets landing on both the same count AND the same
+    sum is a materially harder coincidence than matching count alone.
+
+    R8-B3 fix (Ari's independent REV8 audit, 2026-09-11): the real
+    production connection (get_db()) sets row_factory=sqlite3.Row. The two
+    fingerprint queries have different result-column names (SUM(id) vs
+    SUM(rowid)), and sqlite3.Row equality considers column names as well
+    as values -- so the fingerprint comparison was ALWAYS unequal in
+    production regardless of the actual numbers, silently forcing the
+    full check on every single call and defeating the entire point of
+    this shortcut. Only my own ad-hoc plain sqlite3.connect() test
+    harness (default tuple row_factory) ever exercised the path where
+    they could compare equal. Both fingerprints are now cast to plain
+    tuples before comparing, so only the values matter.
+
+    R8-B1 fix, this function's own share of it (Ari's independent REV8
+    audit, 2026-09-11): neither the cheap fingerprint nor the TTL bound
+    can guarantee the FIRST search after a restore is correct -- the
+    fingerprint can't see a same-count-same-sum collision or a same-id
+    stale-CONTENT restore (that one is _ensure_fts_index_consistent's own
+    fix, see its docstring), and the TTL is a bound on how long staleness
+    is *tolerated*, not a promise it never happens on the very next call.
+    But the actual scenario all of this exists for -- a real restore -- is
+    a real file write, and a real file write reliably advances the file's
+    mtime (often its size too). This is NOT reintroducing mtime/size as
+    database IDENTITY (R3-B1 already established that's unsafe, due to
+    granularity/same-size collisions) -- it's used only as a one-way
+    trigger, layered on top of the existing instance-stamp keying, not
+    instead of it: "this file was touched since the last time I looked at
+    it" forces an immediate full check regardless of what the cheap
+    fingerprint says. A false negative here (an adversarial restore that
+    happens to land on an identical mtime AND size) falls back to exactly
+    the same TTL-bounded staleness as before R8 -- no worse than before.
+    A true positive (the overwhelming common case for any real restore
+    mechanism: cp, rsync, a backup tool, a plain file replace) is what
+    actually closes Ari's first-public-search requirement.
+
+    Measured honestly, not assumed: on THIS schema, mtime/size is a
+    strictly weaker signal than it sounds. Every database built from
+    init_schema.sql pre-allocates ~587 pages for the schema itself
+    (tables/indices/triggers/FTS shadow tables), and a handful of test-
+    scale content rows never cross that page count -- so st_size is
+    provably identical across two genuinely different small databases
+    sharing this schema, not just occasionally. st_mtime_ns has a
+    measured ~2-second granularity on this filesystem (NTFS via this
+    project's own scratch temp directory), so two real writes within that window are
+    indistinguishable by mtime too. (PRAGMA data_version and the SQLite
+    file-header change counter were also measured directly and rejected
+    for the same reason: the former is scoped per-connection, not
+    per-file, so a fresh connection's baseline reading carries no memory
+    of a previous connection's state; the latter tracks transaction
+    COUNT, and this test harness's schema-init + content-insert sequence
+    happens to land both scenarios on an identical count regardless of
+    row content.) So: real, valuable, but not airtight -- a restore
+    landing inside that ~2-second/same-page-count window is invisible to
+    this layer and falls back to the TTL bound, same as before R8.
+
+    For exactly that reason, invalidate_fts_check_cache() below exists as
+    the "actual caller and tested path" for explicit invalidation Ari's
+    own R7-B1 report asked for -- any future restore tooling (a real
+    `brainctl restore` command, a backup-restore script) that runs IN
+    this process should call it as its last step, and gets an airtight
+    guarantee this passive layer alone cannot promise. Today, restores in
+    this codebase happen entirely out-of-band (no in-process restore
+    function exists to wire it into yet) -- documented here rather than
+    silently assumed solved.
+
+    Returns True if a check+repair ran this call AND the repair actually
+    succeeded. Returns False in two different cases, deliberately not
+    distinguished by this boolean alone (see R9-B2 below): the file wasn't
+    touched, the fingerprint matched, and this exact (path, instance) was
+    checked within the last _FTS_REBUILD_CHECK_TTL_SECONDS (nothing needed
+    to run) -- OR a check did run but the repair itself failed.
+
+    R9-B2 fix (Ari's independent REV9 audit, 2026-09-11): this function
+    used to return True whenever a check ran, regardless of whether
+    _ensure_fts_index_consistent actually succeeded, and unconditionally
+    wrote a cache entry either way. Ari reproduced a real transient
+    failure (the rebuild's own INSERT denied at the SQLite authorizer
+    level) and showed the caller ignored that failure and cached it as a
+    successful, timestamped check anyway -- meaning the very next call,
+    for up to the full TTL window, trusted a repair that never happened.
+    A failed repair no longer writes a cache entry at all, so the next
+    call retries immediately rather than extending the failure's silence.
+    """
+    # R1 fix (Grok's independent sweep, 2026-09-16, BCTL-1G): db_key is now
+    # built from the normalized path (see _normalize_db_path_str's own
+    # docstring) so two spellings of the same file on Windows (forward vs
+    # backward slashes) can't split into two separate cache entries.
+    _norm_db_path = _normalize_db_path_str(db_path)
+    instance_id = _db_instance_id(conn)
+    if instance_id is not None:
+        db_key = f"{_norm_db_path}:instance:{instance_id}"
+    else:
+        try:
+            _stat = os.stat(db_path)
+            db_key = f"{_norm_db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+        except OSError:
+            db_key = _norm_db_path
+
+    try:
+        _stat = os.stat(db_path)
+        file_fp = (_stat.st_mtime_ns, _stat.st_size)
+    except OSError:
+        file_fp = None
+
+    now = time.monotonic()
+    cached = _FTS_REBUILD_CHECKED_PATHS.get(db_key)
+
+    if cached is not None:
+        last_checked, cached_file_fp = cached
+        file_touched = (
+            file_fp is not None and cached_file_fp is not None and file_fp != cached_file_fp
+        )
+        if not file_touched and (now - last_checked) < _FTS_REBUILD_CHECK_TTL_SECONDS:
+            try:
+                # (COUNT, SUM(id)) fingerprint -- see R7-B1/R8-B3 above.
+                # COALESCE guards the empty-set case, where SUM is NULL
+                # rather than 0 and would otherwise compare unequal to itself.
+                eligible_fp = tuple(conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM memories "
+                    "WHERE retired_at IS NULL AND indexed = 1"
+                ).fetchone())
+                indexed_fp = tuple(conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(rowid), 0) FROM memories_fts_docsize"
+                ).fetchone())
+                counts_mismatched = eligible_fp != indexed_fp
+            except sqlite3.Error:
+                counts_mismatched = False  # schema not initialized -- let the normal path's own try/except handle it
+            if not counts_mismatched:
+                return False
+
+    # R9-B2 fix (Ari's independent REV9 audit, 2026-09-11): the return value
+    # used to be discarded here -- a FAILED repair (e.g. the authorizer
+    # denying the rebuild write, a real transient condition Ari reproduced
+    # directly) still got recorded as "checked just now," so the very next
+    # call trusted that phantom success and skipped retrying for the full
+    # TTL window, even though nothing was actually fixed. Only cache this
+    # (path, instance) as checked when the repair actually reports success --
+    # a failure leaves no cache entry, so the next call retries immediately
+    # instead of extending a failure's silence for up to
+    # _FTS_REBUILD_CHECK_TTL_SECONDS.
+    repaired = _ensure_fts_index_consistent(conn)
+    if repaired:
+        _FTS_REBUILD_CHECKED_PATHS[db_key] = (now, file_fp)
+    return repaired
+
+
+def _refresh_fts_check_fingerprint(db_key: str, db_path) -> None:
+    """Self-touch/write-amplification fix (Morrow's independent blind test,
+    2026-09-15/16, non-blocking caveat named alongside BCTL-18): the file
+    fingerprint `_cold_start_check_once` caches is always captured at the
+    very TOP of that function -- before this call's own search runs, before
+    any repair it triggers, and before this call's own `log_access`/recall-
+    boost writes and final `commit()`. Those bookkeeping writes reliably
+    advance the database file's mtime (often its size too), so the NEXT
+    call's `_cold_start_check_once` sees "file touched since last checked"
+    and runs a full, unconditional `_ensure_fts_index_consistent` rebuild --
+    even though nothing actually happened between calls except this
+    process's own ordinary bookkeeping. Reproduced directly: four ordinary
+    searches spaced across this filesystem's mtime-granularity bucket
+    triggered four full rebuilds, one per call, purely from each call's own
+    trailing writes.
+
+    Fix: after a call's own writes are fully committed, re-stamp the SAME
+    cache entry `_cold_start_check_once` may have read or written earlier in
+    this same call with the file's CURRENT (post-write) fingerprint. The
+    next call then compares against "what the file looked like after the
+    last call's own writes," not "what it looked like before them" -- so
+    only a genuine out-of-band touch between calls (an actual restore) still
+    reads as `file_touched`, not this process's own ordinary bookkeeping.
+
+    Deliberately narrow: only refreshes an EXISTING cache entry's
+    fingerprint half, never creates one and never touches the `last_checked`
+    timestamp half -- cache lifecycle (when to next run a full check, TTL
+    expiry) stays entirely `_cold_start_check_once`'s own responsibility.
+    If no entry exists yet for this (path, instance) -- e.g. the very first
+    call ever, or `_db_instance_id` wasn't stampable -- there's nothing to
+    refresh and this is a deliberate no-op, not an error.
+
+    Safe to call even if the repair path was taken this call (the fresh
+    file_fp captured here reflects the rebuild's own writes too, same as
+    any other write) or if `_cold_start_check_once` was never called at all
+    this request (also a no-op, same reasoning).
+
+    **Must be called AFTER the connection is closed, not before** -- found
+    by direct measurement, not assumed: closing a connection can itself
+    trigger SQLite's own WAL checkpoint, which is what actually flushes
+    the accumulated writes into the main database file and bumps ITS
+    mtime. Calling this while `conn` is still open (even after `commit()`)
+    captured the file's PRE-checkpoint fingerprint every time, identical
+    to the stale one already cached -- a real no-op bug caught by tracing
+    actual stat() values through a live run rather than trusting the logic
+    read correctly on paper. `db_key` must therefore be resolved from the
+    connection BEFORE closing it (via `resolve_fts_check_db_key` below) and
+    passed in here as a plain string, since this function itself no longer
+    touches `conn` at all."""
+    if db_key not in _FTS_REBUILD_CHECKED_PATHS:
+        return
+
+    try:
+        _stat = os.stat(db_path)
+        file_fp = (_stat.st_mtime_ns, _stat.st_size)
+    except OSError:
+        return
+
+    last_checked, _stale_fp = _FTS_REBUILD_CHECKED_PATHS[db_key]
+    _FTS_REBUILD_CHECKED_PATHS[db_key] = (last_checked, file_fp)
+
+
+def _resolve_fts_check_db_key(conn, db_path) -> str:
+    """Compute the same `_FTS_REBUILD_CHECKED_PATHS` key `_cold_start_check_once`
+    uses, for a caller (`_refresh_fts_check_fingerprint`) that needs it AFTER
+    the connection that could answer `_db_instance_id` is already closed.
+    Call this BEFORE closing `conn`; pass the resulting string to the
+    refresh function AFTER closing it.
+
+    R1 fix (Grok's independent sweep, 2026-09-16, BCTL-1G): built from the
+    normalized path, same as `_cold_start_check_once` -- see
+    `_normalize_db_path_str`'s own docstring."""
+    _norm_db_path = _normalize_db_path_str(db_path)
+    instance_id = _db_instance_id(conn)
+    if instance_id is not None:
+        return f"{_norm_db_path}:instance:{instance_id}"
+    try:
+        _stat = os.stat(db_path)
+        return f"{_norm_db_path}:{_stat.st_mtime_ns}:{_stat.st_size}"
+    except OSError:
+        return _norm_db_path
+
+
+def _commit_if_owned(conn, had_txn: bool) -> None:
+    """R2-F1 fix: a helper that unconditionally calls conn.commit() finalizes
+    whatever unrelated work the CALLER already had pending in an open
+    transaction, not just its own changes -- confirmed as a real defect by
+    Ari's REV2 review. Only commit if this call is the one that opened the
+    transaction (i.e. conn.in_transaction was already False when it started);
+    otherwise leave the commit/rollback decision to whoever owns it."""
+    if not had_txn:
+        conn.commit()
 
 
 def _ensure_fts_index_consistent(conn) -> bool:
-    """Detect and repair a corrupt ``memories_fts`` index.
+    """Detect and repair a corrupt or stale ``memories_fts`` index.
 
     Issue #97 (issue 2): on some platforms the startup-script FTS rebuild
     silently fails or never runs, leaving a populated ``memories`` table
@@ -320,46 +768,859 @@ def _ensure_fts_index_consistent(conn) -> bool:
     workaround was a manual rebuild via
     ``INSERT INTO memories_fts(memories_fts) VALUES('rebuild')``.
 
-    External-content FTS5 (the shape ``memories_fts`` uses,
-    ``content=memories, content_rowid=id``) cannot be verified by row
-    counts: ``COUNT(*)`` on the FTS table reads through to the source
-    table whether or not the inverted index is built. Instead we use the
-    FTS5 ``'integrity-check'`` command, which raises
-    ``sqlite3.DatabaseError`` when the index is inconsistent — that's
-    the canonical way SQLite tells us the index is broken.
+    R8-B1 fix (Ari's independent REV8 audit, 2026-09-11): this used to
+    branch on two structural checks -- an id-SET comparison (eligible ids
+    vs raw FTS docids) and FTS5's own ``'integrity-check'`` command -- and
+    only rebuild when one of those flagged a problem. Both checks verify
+    *which ids are present*, never *whether the indexed text for a
+    present id still matches the current* ``memories.content`` *value at
+    that id*. A restored database can carry a raw FTS entry for the SAME
+    id whose tokenized text is stale relative to the real row; neither
+    check can ever see that, so the old logic left this case permanently
+    unrepaired -- not just bounded by the caller's TTL, genuinely never
+    fixed. Ari proved this directly: a same-id, same-count, same-sum
+    restore with stale indexed text still returned the wrong search
+    results even after simulating the TTL's expiry and letting this
+    function run to completion.
+
+    The only mechanism that actually guarantees content freshness is a
+    real rebuild, which recomputes every FTS posting directly from
+    ``memories.content``. This function is only ever reached rarely,
+    gated by ``_cold_start_check_once``'s own TTL/instance-stamp
+    bookkeeping -- so rebuilding unconditionally whenever it *does* run
+    is the same cost class as the old id-mismatch rebuild path for the
+    common healthy case, and it closes an otherwise-permanent gap for the
+    restored-with-stale-postings case. It also subsumes the original
+    structural-corruption motivation (issue #97) for free: a rebuild
+    fixes that too, by construction, so the separate integrity-check is
+    no longer needed as a distinct code path.
 
     Returns ``True`` if a rebuild was actually performed, ``False`` if
-    the index was already healthy, the schema isn't initialized, or
-    there are no memories to back an index against.
+    the schema isn't initialized or the rebuild/purge failed but was
+    cleanly undone. Raises ``_FTSCleanupUnresolvedError`` (see that
+    class's own docstring) if even the undo itself could not be
+    completed -- callers must not treat that as an ordinary ``False``.
+
+    **BW-B1 fix (Ari's independent REV15/16 backward adversarial audit,
+    2026-09-15), a real redesign, not a patch:** the rebuild step imports
+    EVERY row in ``memories`` regardless of eligibility (see
+    ``_purge_ineligible_fts_rows``'s own docstring), then the purge
+    removes the ineligible ones. The first version only rolled back the
+    OUTER transaction, and only when this function itself had opened it
+    -- two real, independently reproduced gaps followed: (1) when the
+    caller already owned the transaction, this function correctly never
+    touched it (per this file's standing rule), but then had no way to
+    undo its OWN partial changes without also touching the caller's
+    unrelated pending work, so it just returned ``False`` and left the
+    partial rebuild mixed into whatever the caller committed later; (2)
+    when this function did own the transaction and its own outer
+    rollback itself failed (a real, reproduced case, not hypothetical),
+    the exception was swallowed and an ordinary ``False`` returned as if
+    cleanup had succeeded, when the transaction was in fact still open
+    with partial changes.
+
+    Both are fixed the same way: a ``SAVEPOINT`` scopes the rebuild+purge
+    regardless of transaction ownership, so ``ROLLBACK TO SAVEPOINT``
+    undoes only this function's own changes -- the caller's own pending
+    work, if any, is preserved untouched either way. If that savepoint
+    rollback/release ALSO fails, that is a strictly worse, genuinely
+    unresolved state (this function's own attempt to undo itself didn't
+    even succeed) -- raised as ``_FTSCleanupUnresolvedError`` rather than
+    silently reported as an ordinary ``False``, so a caller that needs to
+    stop (rather than proceed to log/recall writes or a commit on top of
+    unresolved state) has something concrete to catch.
+    """
+    # R2-F1: capture this BEFORE any write, so a caller's own already-open
+    # transaction is never finalized by this function's commits below.
+    # getattr fallback: some existing tests pass a duck-typed proxy around
+    # a real connection (only execute()/commit()) rather than a genuine
+    # sqlite3.Connection -- caught as a real regression when this shipped
+    # without it. Defaulting to False there just preserves the pre-fix
+    # unconditional-commit behavior for that narrow case, not a real gap
+    # for actual connections, which always have the attribute.
+    had_txn = getattr(conn, "in_transaction", False)
+
+    try:
+        conn.execute("SELECT count(*) FROM memories LIMIT 1")
+    except sqlite3.Error:
+        return False  # schema not initialized -- nothing to check against
+
+    try:
+        conn.execute("SAVEPOINT fts_consistency_repair")
+    except sqlite3.Error:
+        return False  # cannot even open the savepoint -- nothing attempted, nothing to undo
+
+    try:
+        _rebuild_fts_index_or_raise(conn)
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT fts_consistency_repair")
+            conn.execute("RELEASE SAVEPOINT fts_consistency_repair")
+        except sqlite3.Error as cleanup_error:
+            raise _FTSCleanupUnresolvedError(
+                "FTS rebuild/purge failed and undoing it via SAVEPOINT also failed -- "
+                "unresolved partial index state"
+            ) from cleanup_error
+        return False
+
+    try:
+        conn.execute("RELEASE SAVEPOINT fts_consistency_repair")
+    except sqlite3.Error as cleanup_error:
+        # The rebuild+purge itself succeeded, but releasing the savepoint
+        # failed -- same unresolved-state class as above, just at the
+        # opposite (success) branch. Do not proceed to _commit_if_owned
+        # on top of this.
+        raise _FTSCleanupUnresolvedError(
+            "FTS rebuild/purge succeeded but releasing its savepoint failed"
+        ) from cleanup_error
+
+    _commit_if_owned(conn, had_txn)
+    return True
+
+
+class _FTSCleanupUnresolvedError(sqlite3.Error):
+    """Raised by ``_ensure_fts_index_consistent`` when its own
+    SAVEPOINT-scoped cleanup (``ROLLBACK TO SAVEPOINT``/``RELEASE``)
+    fails, in either direction -- a strictly worse, unresolved state than
+    an ordinary ``False`` return, since this function's own attempt to
+    undo (or finalize) its changes did not even succeed. Subclasses
+    ``sqlite3.Error`` so any existing bare ``except sqlite3.Error``
+    elsewhere still catches it as a safety net (preserving every other
+    caller's pre-existing behavior unchanged), but is distinctly named so
+    a caller that actually needs to (``tool_memory_search``, via
+    ``_cold_start_check_once``) can catch it specifically and stop before
+    any further log/recall write or commit, rather than silently
+    proceeding on top of genuinely unresolved state -- Ari's independent
+    REV15/16 backward adversarial audit, 2026-09-15."""
+
+
+def _rebuild_fts_index_or_raise(conn) -> None:
+    """The actual rebuild+purge SQL, factored out (R13 retained-gap fix,
+    Ari's independent REV13 audit, 2026-09-15) so ``_ensure_fts_index_consistent``
+    (broad bool-returning contract, unrelated callers like
+    ``_cold_start_check_once``) and the busy-snapshot-aware verification
+    path (``_repair_and_reverify_once``, which needs the real
+    ``sqlite_errorcode`` to survive to its own classification) share one
+    definition instead of two copies that could silently drift apart --
+    the first implementation of the verification path duplicated this SQL
+    inline rather than sharing it. Raises on any ``sqlite3.Error``;
+    callers decide what that means for them."""
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+    _purge_ineligible_fts_rows(conn)
+
+
+_BUSY_SNAPSHOT = "busy_snapshot"
+
+# Release-gate cooperative verification budget (D4) -- see
+# _verify_restore_time_order's own docstring for the real measurement
+# this number is based on (2026-09-15: 12.66ms/213 rows, 22.54ms/2000,
+# 74.62ms/10000 healthy; 112ms/10000 forced full rebuild). Cooperative
+# only: checked before starting an attempt, never interrupts one already
+# running.
+_VERIFY_COOPERATIVE_BUDGET_SECONDS = 2.0
+
+
+def _classify_sqlite_error(e: sqlite3.Error) -> str:
+    """Distinguish SQLITE_BUSY_SNAPSHOT (restart the whole verification
+    attempt -- a concurrent writer committed between this call's snapshot
+    and its first write-since-read, not an ordinary lock wait) from any
+    other sqlite3.Error (a real repair/verification failure). Classified
+    via the actual extended result code (`e.sqlite_errorcode`), never by
+    matching the exception's message text -- v5 design doc, V3-3."""
+    return _BUSY_SNAPSHOT if getattr(e, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY_SNAPSHOT else "other"
+
+
+def _build_ordered_reference(fts_q: str, full_eligible_rows, row_matches_filter, limit) -> tuple:
+    """Build the ordered top-k reference id list for restore-time search
+    verification (RESTORE_VERIFICATION_DESIGN_v5_state_machine, B2/D1),
+    corrected by R13-B3 (Ari's independent REV13 audit, 2026-09-15).
+
+    The disposable ``:memory:`` FTS5 table MUST use the exact same
+    tokenize argument and column list as production ``memories_fts``
+    (content, category, tags, tokenize='porter unicode61') -- if it used
+    SQLite's FTS5 defaults instead, bm25 order would not match even on a
+    provably healthy database (v5 B2).
+
+    **R13-B3 fix, real behavior change from the first version:**
+    ``full_eligible_rows`` must be the TRUE full eligible population
+    (every ``indexed=1, retired_at IS NULL`` row, unfiltered by the
+    caller's own category/scope/borrow_from/memory_type constraints) --
+    the same population production's own ``memories_fts`` index actually
+    contains, since it's populated by triggers scoped exactly that way.
+    Production's query applies its caller-specific filters as a SQL WHERE
+    clause AFTER matching against that full-corpus-statistics index, not
+    by searching a pre-filtered subset -- bm25 depends on corpus-wide
+    term/document-length statistics, so indexing only the caller's
+    filtered rows here (the first version's bug) gives the reference
+    completely different statistics than production, and a perfectly
+    healthy, correctly-ranked filtered search would look like a mismatch
+    on every call. Ari's reproduction: a 2-row healthy lesson category
+    with 20 unrelated fact rows also matching the query -- production
+    correctly ranks by full-corpus statistics; the old filtered-subset
+    reference ties the two lesson rows and disagrees.
+
+    Fixed by indexing the FULL eligible corpus (real statistics) here,
+    running MATCH+ORDER BY unbounded, and applying ``row_matches_filter``
+    (the caller's own filter predicate, mirroring its SQL WHERE clause
+    exactly) to the resulting ranked list in Python, truncating to
+    ``limit`` only after filtering -- the same order of operations SQL
+    itself uses (WHERE narrows which ranked rows count toward the LIMIT;
+    it does not change the ranking inputs).
+
+    Returns ``(ordered_ids: list, ok: bool)`` -- ``ok`` is False only if
+    the reference table itself could not be built or queried, distinct
+    from "built fine, zero matches" (an empty list with ``ok=True``).
+    """
+    verify_conn = None
+    try:
+        verify_conn = sqlite3.connect(":memory:")
+        verify_conn.execute(
+            "CREATE VIRTUAL TABLE reference USING fts5(content, category, tags, tokenize='porter unicode61')"
+        )
+        by_id = {}
+        insert_rows = []
+        for row in full_eligible_rows:
+            rid = row["id"]
+            by_id[rid] = row
+            insert_rows.append((rid, row["content"] or "", row["category"] or "", row["tags"] or ""))
+        verify_conn.executemany(
+            "INSERT INTO reference(rowid, content, category, tags) VALUES (?, ?, ?, ?)",
+            insert_rows,
+        )
+        ranked = verify_conn.execute(
+            "SELECT rowid FROM reference WHERE reference MATCH ? ORDER BY rank, rowid",
+            (fts_q,),
+        ).fetchall()
+        # R14-B2 fix (Ari's independent REV14 audit, 2026-09-15): the
+        # limit check must happen BEFORE appending, not after -- the first
+        # version appended a matching row, then checked whether the count
+        # had reached `limit`, so limit=0 still appended exactly one row
+        # before its own check fired. Production's SQL `LIMIT 0` returns
+        # zero rows, full stop; the reference must match that exactly or
+        # a healthy limit=0 search falsely disagrees with itself.
+        ordered_ids = []
+        for (rid,) in ranked:
+            if len(ordered_ids) >= limit:
+                break
+            if row_matches_filter(by_id[rid]):
+                ordered_ids.append(rid)
+        return ordered_ids, True
+    except sqlite3.Error:
+        return [], False
+    finally:
+        if verify_conn is not None:
+            verify_conn.close()
+
+
+def _repair_and_reverify_once(db, fts_q: str, fetch_full_eligible, row_matches_filter, limit, primary_pre, run_primary):
+    """One savepoint-guarded repair-and-reverify attempt (v5 step 4),
+    corrected by R13-B1 (Ari's independent REV13 audit, 2026-09-15).
+    Returns ``_BUSY_SNAPSHOT`` (caller restarts the whole outer attempt --
+    v5's per-stage busy-snapshot classification, applied here to the
+    repair call, the fresh-reference fetch, and the primary rerun alike,
+    not only the rebuild) or a ``(commit: bool, result: dict)`` pair.
+
+    ``primary_pre`` and the rerun results from ``run_primary()`` are full
+    result-row lists (dicts with an ``"id"`` key, same shape
+    ``tool_memory_search`` already works with), not bare id lists.
+
+    Uses the shared ``_rebuild_fts_index_or_raise`` primitive (R13
+    retained-gap fix -- the first version duplicated this SQL inline
+    instead of sharing it with ``_ensure_fts_index_consistent``).
+    Deliberately does NOT call ``_ensure_fts_index_consistent`` itself:
+    that function performs its own ``_commit_if_owned`` internally (a
+    second, independent commit that would end this function's own
+    savepoint early) and its own ``except sqlite3.Error: return False``
+    swallows the real error before this function could classify it.
+
+    **R13-B1 fix:** if ``ROLLBACK TO SAVEPOINT``/``RELEASE`` themselves
+    fail after an ordinary repair/rerun error, the repair's partial
+    changes may still be sitting uncommitted in whatever transaction this
+    is -- caller-owned or not. The first version silently ``pass``-ed
+    this and returned an ordinary ``index_repair_failed``, which implies
+    a clean rollback happened when it might not have. Now returns a
+    distinct, more severe ``index_verification_failed`` outcome instead,
+    so the caller never mistakes an unresolved cleanup for an ordinary,
+    fully-undone repair attempt.
     """
     try:
-        active = conn.execute(
-            "SELECT count(*) FROM memories "
-            "WHERE retired_at IS NULL AND indexed = 1"
-        ).fetchone()[0]
+        db.execute("SAVEPOINT restore_verify_repair")
     except sqlite3.Error:
-        return False
-
-    if not active:
-        return False
+        return False, {"results": None, "ok": False, "flag": None}
 
     try:
-        conn.execute(
-            "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')"
+        _rebuild_fts_index_or_raise(db)
+        fresh_reference_ids, fresh_ref_ok = _build_ordered_reference(
+            fts_q, fetch_full_eligible(), row_matches_filter, limit
         )
-    except sqlite3.DatabaseError:
+        if not fresh_ref_ok:
+            raise sqlite3.OperationalError("reference rebuild failed after repair")
+        rerun_results = run_primary()
+        rerun_ids = [r["id"] for r in rerun_results]
+    except sqlite3.Error as e:
+        classification = _classify_sqlite_error(e)
         try:
-            conn.execute(
-                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-            )
-            conn.commit()
+            db.execute("ROLLBACK TO SAVEPOINT restore_verify_repair")
+            db.execute("RELEASE SAVEPOINT restore_verify_repair")
+        except sqlite3.Error:
+            # R13-B1: cleanup itself failed -- do not claim an ordinary
+            # index_repair_failed (implies a clean rollback happened).
+            # This is a strictly worse, terminal state; the caller must
+            # not retry or treat this as ordinary search-write territory.
+            return False, {"results": None, "ok": False, "flag": "index_verification_failed"}
+        if classification == _BUSY_SNAPSHOT:
+            return _BUSY_SNAPSHOT
+        return False, {"results": None, "ok": False, "flag": "index_repair_failed"}
+
+    if rerun_ids == fresh_reference_ids:
+        try:
+            db.execute("RELEASE SAVEPOINT restore_verify_repair")
+        except sqlite3.Error:
+            return False, {"results": None, "ok": False, "flag": "index_verification_failed"}
+        return True, {"results": rerun_results, "ok": True, "flag": None}
+
+    # B3: return primary_pre (captured before this savepoint ever opened),
+    # never the rolled-back rerun's rows, never a fresh re-read (which
+    # could observe a later writer and break the isolation this design
+    # depends on).
+    try:
+        db.execute("ROLLBACK TO SAVEPOINT restore_verify_repair")
+        db.execute("RELEASE SAVEPOINT restore_verify_repair")
+    except sqlite3.Error:
+        return False, {"results": None, "ok": False, "flag": "index_verification_failed"}
+    return True, {"results": primary_pre, "ok": True, "flag": "repair_verification_failed"}
+
+
+def _verify_restore_time_order(db, fts_q: str, fetch_full_eligible, row_matches_filter, limit, run_primary):
+    """Restore-time search correctness, v5 state machine
+    (``RESTORE_VERIFICATION_DESIGN_v5_state_machine_2026-09-15.md``),
+    corrected by R13-B1/B2/B3 (Ari's independent REV13 audit, 2026-09-15).
+    Ordered top-k comparison against a schema-matched in-memory reference
+    built from the FULL eligible corpus (B3), snapshot-owned,
+    savepoint-guarded repair. This is the R11-B2 product decision Ari's
+    REV11 explicitly deferred: ``_verify_and_repair_stale_matches``
+    verifies set MEMBERSHIP/completeness only and never verified relevance
+    ORDER after a restore; this function does.
+
+    **R13-B2 fix, a real behavior change from the first version:**
+    ``run_primary`` is now a callable this function calls ITSELF, once
+    per attempt, inside that attempt's own snapshot -- never a
+    pre-fetched result supplied by the caller. The first version took
+    already-executed primary results from the caller (read before this
+    function's snapshot even opened) and only ever refreshed the
+    REFERENCE on a busy-snapshot retry, comparing a fresh reference
+    against a primary that was never re-acquired -- Ari's real
+    two-connection WAL reproduction caught this directly: three
+    real ``SQLITE_BUSY_SNAPSHOT`` (517) responses, zero primary
+    re-reads. Primary and reference are now acquired together, inside
+    the same snapshot, every attempt, and a retry discards the entire
+    prior attempt's state rather than carrying any of it forward.
+
+    **R13-B2 fix, caller-owned transactions:** a caller-owned transaction
+    cannot be rolled back and restarted by this function (v5's own rule:
+    never finalize a caller-owned transaction, in either direction) --
+    so a busy-snapshot under ``had_txn=True`` is never retried. It
+    returns the degraded current-attempt result immediately (whatever
+    this one attempt actually obtained), the same shape as ordinary
+    snapshot exhaustion, since there is no authority here to restart
+    someone else's transaction.
+
+    **R13-B1 fix:** every ``_finalize``/cleanup call's return value is now
+    checked. A failed owned commit or rollback is terminal -- no retry,
+    no claiming a comparison result that was never actually finalized.
+
+    **Release-gate fix, cooperative verification budget (D4, real
+    measurement 2026-09-15, not an arbitrary number):** measured directly
+    against synthetic corpora before picking a threshold -- the healthy
+    verification path (no repair needed) averaged 12.66ms at 213 rows
+    (today's actual real corpus size), 22.54ms at 2,000, 74.62ms at
+    10,000; a forced full-rebuild repair at 10,000 rows took 112ms. Cost
+    scales with total corpus size on every call (the reference is rebuilt
+    from the full eligible corpus every attempt, not only on repair), not
+    just on failure. ``_VERIFY_COOPERATIVE_BUDGET_SECONDS`` (2.0) is
+    checked before starting the 2nd and 3rd retry attempts only -- this is
+    cooperative, not preemptive: it can skip an attempt that hasn't
+    started yet, it cannot interrupt one already in flight (v4's own
+    stated limit of this mechanism, unchanged here). At a corpus roughly
+    35x today's real size, three full attempts would still fit inside
+    this budget with room to spare; it exists to bound genuinely
+    pathological cases (repeated busy-snapshot contention against a much
+    larger future corpus), not to fire under any condition measured
+    today.
+
+    Returns ``{"results": [...] or None, "ok": bool, "flag": None |
+    "index_repair_failed" | "repair_verification_failed" |
+    "index_verification_failed"}``. ``results`` is ``None`` only when
+    ``ok`` is False with nothing honest to report.
+    """
+    had_txn = getattr(db, "in_transaction", False)
+    _last_primary_results = None  # R13-B2: the most recent attempt's own primary, discarded each retry
+    _verify_start = time.monotonic()
+
+    def _finalize(commit: bool) -> bool:
+        # Caller-owned transactions are never finalized here, in either
+        # direction -- only this function's own savepoint (if any) was
+        # ever touched above.
+        if had_txn:
+            return True
+        try:
+            db.commit() if commit else db.rollback()
             return True
         except sqlite3.Error:
             return False
+
+    for _attempt in range(3):
+        # Cooperative budget (D4): only checked before STARTING an
+        # attempt, never mid-flight. _attempt == 0 always runs regardless
+        # of budget -- a caller gets at least one real verification
+        # attempt no matter how the clock looks; only the 2nd/3rd retry
+        # can be skipped this way. Exhaustion below already handles
+        # reporting whatever the most recent attempt actually obtained.
+        if _attempt > 0 and (time.monotonic() - _verify_start) >= _VERIFY_COOPERATIVE_BUDGET_SECONDS:
+            break
+        primary_results = None
+        # Reset in lockstep with primary_results at the top of every
+        # attempt, not just on success -- otherwise a final attempt that
+        # fails before ever reaching run_primary() (e.g. BEGIN DEFERRED
+        # itself raising) would leave a PRIOR, already-discarded attempt's
+        # primary sitting here at exhaustion, violating "discard all
+        # prior-attempt results before retry."
+        _last_primary_results = None
+        try:
+            if not had_txn:
+                db.execute("BEGIN DEFERRED")
+            # R13-B2: primary acquired HERE, inside this attempt's own
+            # snapshot, same as the reference -- never supplied pre-fetched.
+            primary_results = run_primary()
+            _last_primary_results = primary_results
+            reference_ids, ref_ok = _build_ordered_reference(
+                fts_q, fetch_full_eligible(), row_matches_filter, limit
+            )
+            if not ref_ok:
+                raise sqlite3.OperationalError("reference build failed")
+        except sqlite3.Error as e:
+            busy = _classify_sqlite_error(e) == _BUSY_SNAPSHOT
+            if had_txn:
+                # R13-B2: cannot roll back or restart someone else's
+                # transaction. Report the degraded current-attempt state
+                # immediately -- no retry is possible from here.
+                if busy and primary_results is not None:
+                    return {"results": primary_results, "ok": True, "flag": "index_verification_failed"}
+                return {"results": None, "ok": False, "flag": None}  # B1 row 0
+            # Owned: this attempt's transaction must be rolled back before
+            # either retrying BEGIN DEFERRED (which raises "cannot start a
+            # transaction within a transaction" on top of one already
+            # open) or returning. R13-B1: if the rollback itself fails,
+            # that is terminal -- do not retry on top of an unresolved
+            # cleanup.
+            if not _finalize(commit=False):
+                return {"results": None, "ok": False, "flag": "index_verification_failed"}
+            if busy:
+                continue  # discard this attempt entirely; try a fresh one
+            return {"results": None, "ok": False, "flag": None}  # B1 row 0
+
+        primary_ids = [r["id"] for r in primary_results]
+        if primary_ids == reference_ids:
+            if not _finalize(commit=True):
+                # R13-B1: a failed commit must not report a clean success.
+                return {"results": None, "ok": False, "flag": "index_verification_failed"}
+            return {"results": primary_results, "ok": True, "flag": None}  # B1 row 1: no mismatch
+
+        outcome = _repair_and_reverify_once(
+            db, fts_q, fetch_full_eligible, row_matches_filter, limit, primary_results, run_primary
+        )
+        if outcome == _BUSY_SNAPSHOT:
+            if had_txn:
+                # _repair_and_reverify_once already rolled back to its own
+                # SAVEPOINT -- same R13-B2 reasoning as above, no retry.
+                return {"results": primary_results, "ok": True, "flag": "index_verification_failed"}
+            if not _finalize(commit=False):
+                return {"results": None, "ok": False, "flag": "index_verification_failed"}
+            continue  # discard this attempt entirely; try a fresh one
+        commit, result = outcome
+        if not result["ok"]:
+            # R14-B1 fix (Ari's independent REV14 audit, 2026-09-15): this
+            # outer rollback's own return value was being discarded -- an
+            # injected rerun error followed by a failed outer rollback
+            # still returned the inner result's ordinary index_repair_failed
+            # unchanged, with the outer transaction left open. That's a
+            # worse, unresolved-cleanup state than an ordinary repair
+            # failure and must be promoted to index_verification_failed,
+            # not silently reported as the milder flag. Still ok=false,
+            # still no retry -- only the lost signal is being restored here.
+            if not _finalize(commit=False):
+                result = {"results": None, "ok": False, "flag": "index_verification_failed"}
+            return result
+        if not _finalize(commit):
+            # R13-B1: a failed commit/rollback after a real comparison
+            # must not report the comparison's result as final.
+            return {"results": None, "ok": False, "flag": "index_verification_failed"}
+        return result
+
+    # R13-B2: owned snapshot retries exhausted -- use the FINAL attempt's
+    # own primary (tracked explicitly across the loop, never a discarded
+    # earlier attempt's), not an assumption that one always exists.
+    if _last_primary_results is not None:
+        return {"results": _last_primary_results, "ok": True, "flag": "index_verification_failed"}
+    return {"results": None, "ok": False, "flag": None}
+
+
+def _fts_matches_real_content(fts_q: str, id_field_rows) -> tuple:
+    """Build one small, disposable, in-memory FTS5 table (same tokenizer AND
+    same three indexed columns as the real index: content, category, tags --
+    R10-B2 fix, Ari's independent REV10 audit, 2026-09-14. The real
+    `memories_fts` table indexes all three columns (see init_schema.sql);
+    the first version of this verifier only built/checked `content`, which
+    cut both ways -- a restored category-only or tag-only match silently
+    verified as "no real match" (false negative on top of the original
+    false negative this whole mechanism exists to catch), AND a perfectly
+    healthy category-only or tag-only hit looked like a mismatch against
+    this narrower check, triggering repeated unnecessary rebuilds on every
+    call for content that was never actually stale -- a real regression
+    Ari's REV10 caught, not present in REV9.
+
+    `id_field_rows` is (id, content, category, tags) tuples. Returns
+    `(matched_ids: set, verification_ok: bool)`. R10-B3 fix: verification
+    failure (the in-memory connection or a query on it raising) is no
+    longer silently collapsed into "genuinely no match" -- the first
+    version returned a bare empty set indistinguishable from a real
+    negative result, so a verifier fault on top of a stale index produced
+    `ok: True, count: 0` with no signal anything was wrong. Callers must
+    check `verification_ok` before trusting an empty `matched_ids` as a
+    real answer. The connection is closed in a `finally` block so a raised
+    exception doesn't leak it -- the prior version only closed on the
+    success path."""
+    verify_conn = None
+    try:
+        verify_conn = sqlite3.connect(":memory:")
+        verify_conn.execute(
+            "CREATE VIRTUAL TABLE verify USING fts5(content, category, tags, tokenize='porter unicode61')"
+        )
+        verify_conn.executemany(
+            "INSERT INTO verify(rowid, content, category, tags) VALUES (?, ?, ?, ?)",
+            [(i, c or "", cat or "", t or "") for i, c, cat, t in id_field_rows],
+        )
+        matched = {
+            row[0] for row in verify_conn.execute(
+                "SELECT rowid FROM verify WHERE verify MATCH ?", (fts_q,)
+            ).fetchall()
+        }
+        return matched, True
+    except sqlite3.Error:
+        return set(), False
+    finally:
+        if verify_conn is not None:
+            verify_conn.close()
+
+
+def _verify_and_repair_stale_matches(db, fts_q: str, results: list, rerun, fetch_eligible_content=None, limit=None):
+    """R9-B1 fix (Ari's independent REV9 audit, 2026-09-11), corrected by
+    R10-B1/R10-B2/R10-B3 (Ari's independent REV10 audit, 2026-09-14), and
+    again by R11-B1 (Ari's independent REV11 audit, 2026-09-14, same day --
+    fast turnaround).
+
+    **R11-B1 fix, a real regression R10-B1 introduced:** comparing the full
+    real eligible match SET against the primary query's LIMITED result set
+    for exact equality is wrong whenever there are genuinely more matches
+    than requested slots -- ordinary bounded retrieval (more real matches
+    than `limit`) looks IDENTICAL to a set-equality check as the actual
+    defect class this whole mechanism exists to catch (some matches
+    silently missing). Ari measured this directly: a healthy index with 14
+    real matches and a 7-slot tier cap forced a full rebuild on every
+    single call, for perfectly correct behavior. The fix compares against
+    an EXPECTED count, not the raw eligible-set size: `min(limit,
+    len(real_ids))` -- the number of real matches that should have come
+    back given the bounded query contract. Combined with the existing
+    subset check (every returned id must actually be a real match), this
+    still catches genuine incompleteness (fewer returned than the bounded
+    contract promised, or a returned id that isn't real) while no longer
+    flagging ordinary truncation as staleness.
+
+    Every passive layer in this file (_db_instance_id's stamp,
+    _cold_start_check_once's TTL/fingerprint/file-touch bookkeeping) tries
+    to INFER whether a restore happened, so it knows when to bother
+    re-checking. Ari proved directly, three times now (REV8, REV9, REV10),
+    that inference can't guarantee a search is correct -- there will
+    always be a residual case no cheap passive signal can see, because
+    none of them actually look at content. The only way to stop guessing
+    is to check the actual claim a MATCH makes against every row that
+    could have made it.
+
+    **R10-B1 correction, the actual behavior change from R9-B1's design:**
+    the original version only verified already-RETURNED rows when results
+    were non-empty, and only scanned the full eligible set when results
+    were completely empty. Ari proved that split is wrong: a restore can
+    leave one real match findable (correct posting) and a second real
+    match unfindable (stale posting) in the SAME query, so results come
+    back non-empty AND genuinely incomplete at once -- the old non-empty
+    branch verified the one row it had and declared victory, never
+    learning the second row existed. There is no cheap way to distinguish
+    "these results are non-empty and complete" from "these results are
+    non-empty and silently missing rows" without checking against the
+    real eligible set either way -- so this now ALWAYS fetches the
+    eligible set (when `fetch_eligible_content` is supplied) and compares
+    its real FTS-matched ids directly against what the primary query
+    returned, empty or not. This is a real, accepted cost increase (every
+    call now pays the eligible-scan cost previously paid only on empty
+    results) -- Ari's own words, repeated across two reviews: correctness
+    here is not negotiable against speed.
+
+    If the real match set (computed via `_fts_matches_real_content`,
+    which now checks the SAME three columns -- content, category, tags --
+    the real index actually indexes; see R10-B2 in that function's own
+    docstring) equals the set of ids the primary query returned, the
+    results are both valid and complete -- returned unchanged. Any
+    difference at all (missing rows, extra/stale rows, or both) is direct
+    evidence the raw index is inconsistent for this database, not just
+    for one row -- forces an immediate full rebuild, bypassing the
+    TTL/fingerprint cache entirely since this is now positive evidence
+    rather than an inference, and re-runs the query once against the
+    freshly-rebuilt index.
+
+    **R10-B3 correction:** `_fts_matches_real_content` now distinguishes
+    "ran and found no real matches" from "could not run at all" via its
+    own `verification_ok` flag. The first version of this function (and
+    the version before that) collapsed a verifier failure into a bare
+    empty set indistinguishable from a genuine negative result -- exactly
+    the failure-injection case Ari reproduced (a denied verifier
+    connection landing on top of a stale index) would have silently
+    returned `ok: True, count: 0` with real matching content sitting
+    unreached and no signal anything was wrong. A failed verification (at
+    the eligible-fetch step or the FTS-check step) now returns results
+    unchanged with `verification_failed=True` rather than being treated
+    as proof of anything.
+
+    `rerun` is a zero-arg callable that re-executes the original query,
+    supplied by the caller so this function never reconstructs that SQL
+    itself.
+
+    Returns `(results, repair_failed, verification_failed)`.
+    `repair_failed` is True only when real content proved a rebuild was
+    actually needed AND that rebuild itself then failed (e.g. denied at
+    the SQLite authorizer level, the case Ari reproduced for R9-B2) -- the
+    caller surfaces this rather than silently reporting `ok: True` over
+    data proven wrong in the same breath that proved it.
+    `verification_failed` is True when correctness could not be
+    established at all this call (R10-B3) -- distinct from `repair_failed`
+    because no rebuild was ever attempted; there was nothing to compare
+    against.
+
+    R10 additional finding, also fixed here: the prior version called
+    `db.commit()` unconditionally after a repair, bypassing
+    `_ensure_fts_index_consistent`'s own `_commit_if_owned` transaction-
+    ownership tracking -- Ari demonstrated this finalizes whatever
+    unrelated work the CALLER already had pending in an open transaction,
+    not just this function's own changes, the identical class of bug
+    `_commit_if_owned` exists to prevent (R2-F1), reintroduced one call
+    site over. `_ensure_fts_index_consistent` already commits correctly
+    on its own when it owns the transaction; no second commit belongs
+    here.
+
+    **R11-B2, deliberately NOT fixed here -- narrowed scope, not silence.**
+    Ari proved a restore can preserve the correct SET of matching ids while
+    scrambling their RELEVANCE ORDER (stale term-frequency/position data
+    changing which of two real matches should rank first), and this
+    function's membership-only check accepts that silently. I looked hard
+    at fixing this the same way as everything else here (build the
+    disposable verify table with `ORDER BY rank` and compare ordering) and
+    concluded it would be UNSOUND, not just harder: FTS5's default `rank`
+    (bm25) is computed from corpus-wide statistics -- average document
+    length, term document frequency -- across the ENTIRE `memories_fts`
+    virtual table, not the outer SQL query's WHERE-scoped subset. The
+    verify table this function builds only ever contains the current
+    query's ELIGIBLE rows (a small, scope-specific population), which
+    predictably has DIFFERENT corpus statistics than the real index
+    whenever that scope is a fraction of the whole table (borrow_from,
+    category filters, anything but a full unscoped search) -- so a rank
+    comparison against it would produce real false positives (legitimate
+    rank differences flagged as corruption, reintroducing R11-B1's
+    regression in a new shape) as readily as it would catch real ones.
+    Ari's own REV11 report offered this as a legitimate closure path:
+    "close it or explicitly narrow and agree the restore-correctness
+    contract" -- this is that: membership/completeness is verified and
+    guaranteed (R10-B1, R10-B2, R10-B3, R11-B1 above); relevance ORDER
+    after a restore is NOT verified by this mechanism, and claiming
+    otherwise would be the same class of overclaim this whole line of
+    fixes exists to stop making. Flagged to Kelly as a real product
+    decision, not decided unilaterally here.
+    """
+    returned_ids = {r["id"] for r in results}
+
+    if fetch_eligible_content is not None:
+        try:
+            eligible = fetch_eligible_content()
+        except sqlite3.Error:
+            return results, False, True  # can't establish anything this call -- fail open, flagged
+        real_ids, verification_ok = _fts_matches_real_content(fts_q, eligible)
+        if not verification_ok:
+            return results, False, True
+        # R11-B1 fix: expected count respects the bounded query contract --
+        # `limit` real matches at most, or however many real matches exist
+        # if fewer than `limit`. Comparing against the raw eligible-set
+        # size (the old `real_ids == returned_ids`) treated ordinary
+        # truncation as staleness; comparing against this expected count
+        # still catches genuine omission (fewer returned than the contract
+        # promised) and genuine false positives (a returned id that isn't
+        # real) without either regression.
+        expected_count = len(real_ids) if limit is None else min(limit, len(real_ids))
+        if returned_ids <= real_ids and len(returned_ids) >= expected_count:
+            return results, False, False  # bounded contract satisfied, nothing omitted or extra
+    elif results:
+        # No eligible-fetch supplied (defensive/back-compat path): the best
+        # available check is validating the rows already in hand against
+        # their own real content -- can't establish completeness without
+        # an eligible-set fetch, so a clean validation here is NOT the same
+        # guarantee as the branch above and never claims to be.
+        real_ids, verification_ok = _fts_matches_real_content(
+            fts_q, [(r["id"], r.get("content"), r.get("category"), r.get("tags")) for r in results]
+        )
+        if not verification_ok:
+            return results, False, True
+        if real_ids >= returned_ids:
+            return results, False, False
+    else:
+        return results, False, False  # nothing returned, no way to check for omissions
+
+    # BW-B1 fix (Ari's independent REV15/16 backward adversarial audit,
+    # 2026-09-15): _ensure_fts_index_consistent can now raise
+    # _FTSCleanupUnresolvedError in its own genuinely-unresolved-cleanup
+    # case. This function's own external contract (never raises, reports
+    # repair_failed=True instead) predates that change and is preserved
+    # here rather than reopened -- an unresolved cleanup is at least as
+    # bad as an ordinary repair failure from this caller's point of view.
+    try:
+        repaired = _ensure_fts_index_consistent(db)
+    except _FTSCleanupUnresolvedError:
+        repaired = False
+    return rerun(), not repaired, False
+
+
+# Individual complete statements, not one blob to be split on ";" -- each
+# CREATE TRIGGER body contains its own internal semicolons, so a naive split
+# breaks them into invalid fragments (confirmed the hard way: "incomplete
+# input"). Each tuple entry is passed whole to conn.execute().
+# Formatting (line breaks, indentation) matters here, not just for style:
+# SQLite stores each trigger's CREATE statement verbatim in sqlite_master,
+# and _ensure_fts_triggers_scoped compares that text byte-for-byte against
+# these strings to decide whether a repair is a no-op. They must match
+# init_schema.sql's own trigger text exactly, or a freshly-initialized,
+# already-correct database gets misdiagnosed as needing repair.
+_SCOPED_FTS_UPDATE_STATEMENTS = (
+    "DROP TRIGGER IF EXISTS memories_fts_update_delete",
+    "DROP TRIGGER IF EXISTS memories_fts_update_insert",
+    "CREATE TRIGGER memories_fts_update_delete AFTER UPDATE OF content, category, tags, indexed, retired_at "
+    "ON memories WHEN old.indexed = 1 AND old.retired_at IS NULL BEGIN\n"
+    "    INSERT INTO memories_fts(memories_fts, rowid, content, category, tags)\n"
+    "    VALUES ('delete', old.id, old.content, old.category, old.tags);\n"
+    "END",
+    "CREATE TRIGGER memories_fts_update_insert AFTER UPDATE OF content, category, tags, indexed, retired_at "
+    "ON memories WHEN new.indexed = 1 AND new.retired_at IS NULL BEGIN\n"
+    "    INSERT INTO memories_fts(rowid, content, category, tags)\n"
+    "    VALUES (new.id, new.content, new.category, new.tags);\n"
+    "END",
+)
+_SCOPED_FTS_UPDATE_TRIGGERS = ";\n".join(_SCOPED_FTS_UPDATE_STATEMENTS) + ";"
+
+
+# Canonical trigger SQL, exactly as SQLite echoes it back via sqlite_master,
+# used for exact-match detection below. Built by actually creating a scratch
+# in-memory schema rather than hand-typed, so this can never drift from what
+# CREATE TRIGGER above actually produces.
+def _canonical_fts_update_triggers() -> dict:
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.executescript(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, category TEXT, "
+            "tags TEXT, indexed INTEGER, retired_at TEXT);"
+            "CREATE VIRTUAL TABLE memories_fts USING fts5(content, category, tags, "
+            "content=memories, content_rowid=id);"
+            + _SCOPED_FTS_UPDATE_TRIGGERS
+        )
+        return dict(
+            scratch.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('memories_fts_update_delete', 'memories_fts_update_insert')"
+            ).fetchall()
+        )
+    finally:
+        scratch.close()
+
+
+def _purge_ineligible_fts_rows(conn) -> None:
+    """After any 'rebuild', external-content FTS5 has re-imported every row
+    in ``memories`` regardless of indexed/retired_at (B3) -- remove anything
+    that shouldn't be searchable. Safe to call even when nothing needs it."""
+    conn.execute(
+        "INSERT INTO memories_fts(memories_fts, rowid, content, category, tags) "
+        "SELECT 'delete', m.id, m.content, m.category, m.tags "
+        "FROM memories m JOIN memories_fts_docsize d ON d.rowid = m.id "
+        "WHERE NOT (m.indexed = 1 AND m.retired_at IS NULL)"
+    )
+
+
+def _ensure_fts_triggers_scoped(conn) -> bool:
+    """Replace legacy/incomplete/malformed memories_fts update triggers with
+    the exact column-scoped pair (issue #152). Idempotent; returns True only
+    if it actually rewrote them.
+
+    B1 fix: the old check accepted any trigger whose SQL merely contained the
+    substring "AFTER UPDATE OF" -- true for a single stray trigger, for the
+    wrong column list, or for a no-op body. Now compares each trigger's exact
+    SQL text (both name and body) against the canonical definition; anything
+    short of an exact match on BOTH triggers triggers a real repair, including
+    the case where one or both are missing entirely (previously misread as
+    "no rows to fix").
+
+    B2 fix: the DROP+CREATE used to run as a bare executescript, so a CREATE
+    failure after a successful DROP left the database with neither trigger
+    (caught by returning False, indistinguishable from a healthy no-op). Now
+    runs inside a SAVEPOINT that's explicitly rolled back on any error, so a
+    failed repair always leaves the original pair (broken or not) untouched
+    rather than deleting it.
+    """
+    canonical = _canonical_fts_update_triggers()
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('memories_fts_update_delete', 'memories_fts_update_insert')"
+            ).fetchall()
+        )
     except sqlite3.Error:
         return False
-
-    return False
+    if rows == canonical:
+        return False
+    # R2-F1: capture before any write so a caller's own already-open
+    # transaction is never finalized by this function's commit.
+    had_txn = getattr(conn, "in_transaction", False)
+    # Python's sqlite3.executescript() implicitly COMMITs any pending
+    # transaction before running -- that would silently end the SAVEPOINT
+    # below before it could protect anything (confirmed the hard way while
+    # writing this fix's own tests). Run each complete statement individually
+    # via execute() instead, so the SAVEPOINT actually stays open throughout.
+    savepoint_open = False
+    try:
+        conn.execute("SAVEPOINT fts_trigger_repair")
+        savepoint_open = True
+        for stmt in _SCOPED_FTS_UPDATE_STATEMENTS:
+            conn.execute(stmt)
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        _purge_ineligible_fts_rows(conn)
+        conn.execute("RELEASE fts_trigger_repair")
+        _commit_if_owned(conn, had_txn)
+        return True
+    except sqlite3.Error:
+        # R2-F2: if SAVEPOINT itself never succeeded, it doesn't exist --
+        # attempting ROLLBACK TO/RELEASE on a savepoint that was never opened
+        # raises its own fresh, unhandled error instead of returning the
+        # documented False. Only attempt cleanup if we know it's really there.
+        if savepoint_open:
+            try:
+                conn.execute("ROLLBACK TO fts_trigger_repair")
+                conn.execute("RELEASE fts_trigger_repair")
+            except sqlite3.Error:
+                pass
+        return False
 
 
 def ensure_agent(conn, agent_id: str) -> None:
@@ -971,6 +2232,22 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     if memory_type and memory_type not in ("episodic", "semantic", "procedural"):
         return {"ok": False, "error": "memory_type must be 'episodic', 'semantic', or 'procedural'"}
 
+    # BW-B2 fix (Ari's independent REV15 backward adversarial audit,
+    # 2026-09-15): SQLite treats a negative LIMIT as "no limit at all" --
+    # real, documented SQLite semantics, not a bug in the primary query.
+    # The R14-B2 fix (check the limit before appending a reference
+    # candidate) broke on this: for any negative limit, `0 >= limit` is
+    # true on the very first candidate, so the reference always came back
+    # empty regardless of how many real matches existed -- a guaranteed,
+    # permanent disagreement with production's real (unbounded) behavior,
+    # in the dangerous direction: a stale index needing repair could
+    # report `count: 0` with no flag while the true, rebuilt answer had
+    # real matches. Rejected outright here rather than propagated through
+    # to the reference/limit machinery at all, matching the existing
+    # `memory_type` validation pattern immediately above.
+    if limit < 0:
+        return {"ok": False, "error": "limit must be zero or a positive integer"}
+
     # Cross-agent borrow restricts the SQL to `scope='global'` (line ~846).
     # Combining that with an explicit non-global scope produces an
     # impossibly-False predicate and silent 0 results. Surface the misuse
@@ -1004,14 +2281,21 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     if not fts_q:
         return {"ok": False, "error": "Empty query"}
 
-    # Cold-start FTS health check (issue #97-2). The platform startup script
-    # is supposed to rebuild the FTS index, but a silent failure leaves
-    # search returning zero hits despite a populated memories table.
-    # Rebuild once per process if the index looks short.
-    global _FTS_REBUILD_CHECKED
-    if not _FTS_REBUILD_CHECKED:
-        _ensure_fts_index_consistent(db)
-        _FTS_REBUILD_CHECKED = True
+    # Cold-start FTS health check (issue #97-2), once per (db, its current
+    # file state) -- see _cold_start_check_once() for the guard logic itself,
+    # pulled out as its own unit so it's directly testable (R2-F3/F7).
+    # BW-B1 fix (Ari's independent REV15/16 backward adversarial audit,
+    # 2026-09-15): _ensure_fts_index_consistent can raise
+    # _FTSCleanupUnresolvedError when even its own undo-attempt fails --
+    # a genuinely unresolved partial-index state, not an ordinary "nothing
+    # needed fixing" or "fix attempted and cleanly failed" case. Stop here,
+    # before any further read, log write, or recall-footprint write below,
+    # rather than silently proceeding on top of it.
+    try:
+        _cold_start_check_once(db, DB_PATH)
+    except _FTSCleanupUnresolvedError:
+        db.close()
+        return {"ok": False, "index_verification_failed": True}
 
     # Theta-gamma slot cap — enforce 7*tier max slots per retrieval cycle.
     # Tier 1 (default) → 7 slots, tier 2 → 14, tier 3 → 21.
@@ -1023,7 +2307,12 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     max_slots = 7 * tier
     limit = min(limit, max_slots)
 
-    conditions = ["m.retired_at IS NULL"]
+    # R2-B1 defense in depth: filter indexed=1 at the query level too, not
+    # just at write time. Rebuild/repair paths are the primary fix, but a
+    # read-path filter means a construct-only (indexed=0) row can never
+    # surface through ordinary search even if raw FTS membership ever drifts
+    # again for a reason nobody's found yet.
+    conditions = ["m.retired_at IS NULL", "m.indexed = 1"]
     params = [fts_q]
     if borrow_from:
         # Cross-agent borrow: restrict to the other agent's globally-scoped memories
@@ -1044,14 +2333,117 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
         # CLS: explicit type filter — caller wants only episodic or only semantic
         conditions.append("m.memory_type = ?")
         params.append(memory_type)
-    params.append(limit)
     where = " AND ".join(conditions)
+    # R8-B2 fix (Ari's independent REV8 audit, 2026-09-11): the primary
+    # query's borrow/scope/category/memory_type constraints -- especially
+    # the cross-agent borrow_from restriction to the source agent's
+    # scope='global' rows -- must also apply to any candidate-set expander
+    # (temporal neighborhood expansion, below) that pulls rows the primary
+    # query never vetted. Captured here, before `limit` is appended, so it
+    # can be reused as-is: same `where` string, same params in the same
+    # positional order, everywhere this search's constraints need to apply.
+    _search_where_params = list(params[1:])  # params[0] is fts_q, not part of `where`
+    params.append(limit)
 
-    rows = db.execute(
-        f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
-        f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank LIMIT ?", params
-    ).fetchall()
-    results = rows_to_list(rows)
+    def _run_primary_query():
+        # Release-gate fix (production tie-break, retained-open item from
+        # v4/v5/D1 -- "still open, not blocking" until now): `rank` alone
+        # can tie between rows with equal bm25 scores, and SQLite does not
+        # guarantee any particular order among ties. _build_ordered_reference
+        # has always broken ties with `rowid` (== memories.id); this query
+        # never did, so a real tie could disagree between the two on ORDER
+        # even when both sides are perfectly healthy -- a false positive
+        # this design has been vulnerable to since v2. `m.id` matches the
+        # reference's `rowid` tie-break exactly (same underlying value).
+        return rows_to_list(db.execute(
+            f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
+            f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank, m.id LIMIT ?", params
+        ).fetchall())
+
+    def _fetch_full_eligible_content():
+        # R13-B3 fix (Ari's independent REV13 audit, 2026-09-15): the TRUE
+        # full eligible population -- every indexed=1, retired_at IS NULL
+        # row, UNfiltered by this call's own category/scope/borrow_from/
+        # memory_type constraints. This is the same population production's
+        # memories_fts index actually contains (its triggers are scoped
+        # exactly this way, see init_schema.sql) -- indexing only this
+        # call's filtered subset (the pre-R13 bug) gives the disposable
+        # reference table different bm25 statistics than production, and a
+        # perfectly healthy filtered search looks like a mismatch on every
+        # call. Category and tags travel with content (R10-B2 -- both are
+        # real, independently-indexed FTS columns).
+        return db.execute(
+            "SELECT m.id, m.content, m.category, m.tags, m.scope, m.agent_id, m.memory_type "
+            "FROM memories m WHERE m.retired_at IS NULL AND m.indexed = 1"
+        ).fetchall()
+
+    def _row_matches_filter(row) -> bool:
+        # R13-B3: this call's own selection constraints, applied to an
+        # already-ranked candidate (production ranks over the full corpus,
+        # then narrows to this call's rows via its WHERE clause -- this
+        # mirrors that order exactly, never filtering before ranking).
+        # Deliberately a literal, unconditional translation of the `where`/
+        # `conditions` list built above, one predicate per line, rather
+        # than a "smarter" combined check -- so it can't silently drift
+        # from the SQL it mirrors.
+        if borrow_from:
+            if row["agent_id"] != borrow_from:
+                return False
+            if row["scope"] != "global":
+                return False
+        if category:
+            if row["category"] != category:
+                return False
+        elif _profile_categories:
+            if row["category"] not in _profile_categories:
+                return False
+        if scope:
+            if row["scope"] != scope:
+                return False
+        if memory_type:
+            if row["memory_type"] != memory_type:
+                return False
+        return True
+
+    # v5 state machine (RESTORE_VERIFICATION_DESIGN_v5_state_machine_2026-09-15.md),
+    # replacing the call to _verify_and_repair_stale_matches at this site
+    # (REV13, 2026-09-15; corrected by REV13's own findings same day --
+    # see _verify_restore_time_order's docstring for the B1/B2/B3 fixes).
+    # That function is left in place, unchanged and still covered by its
+    # own tests, but no longer called from here -- its set-membership
+    # check never verified relevance ORDER after a restore (R11-B2,
+    # deliberately left open there as a product decision for Kelly). This
+    # is that decision, implemented. Runs unconditionally, including under
+    # benchmark=True -- correctness isn't the thing benchmark mode opts
+    # out of, reranking is. Note: the primary query is no longer run here
+    # directly -- _verify_restore_time_order calls `_run_primary_query`
+    # itself, inside its own snapshot, every attempt (R13-B2).
+    _verify_outcome = _verify_restore_time_order(
+        db, fts_q, _fetch_full_eligible_content, _row_matches_filter, limit, _run_primary_query
+    )
+    if not _verify_outcome["ok"]:
+        # v5 B1: a real, unrepaired failure -- nothing honest to return.
+        # No `count`/`memories` keys, per the design doc's own wording --
+        # distinct from the fail-open "ok: true + stale hits + a flag"
+        # shape used below for the cases where something legitimate can
+        # still be reported. _verify_restore_time_order already finalized
+        # (rolled back) its own transaction before returning here.
+        db.close()
+        error_result = {"ok": False}
+        if _verify_outcome["flag"] == "index_repair_failed":
+            error_result["index_repair_failed"] = True
+        elif _verify_outcome["flag"] == "index_verification_failed":
+            # R13-B1: preserve the terminal signal end to end -- the first
+            # version dropped this flag entirely on the ok=false path.
+            error_result["index_verification_failed"] = True
+        return error_result
+    results = _verify_outcome["results"]
+    # v5's third flag, distinct from the two below: a repair was attempted,
+    # succeeded as a SQL operation, but the rerun still disagreed with a
+    # fresh reference -- rolled back, `results` here is the honest
+    # pre-repair primary, not the discarded rerun (B3).
+    _repair_verification_failed = _verify_outcome["flag"] == "repair_verification_failed"
+    _index_verification_failed = _verify_outcome["flag"] == "index_verification_failed"
 
     # CLS semantic bonus: when no type filter is set, apply a mild confidence
     # multiplier to semantic memories so they score slightly above equivalent
@@ -1132,6 +2524,8 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
     #   - Uses a longer min-token-length (5) and a richer stoplist for
     #     enrichment-term extraction.
     #   - Caps enrichment terms at 5 (down from 10) — fewer drift vectors.
+    _multi_pass_skipped = False
+    _multi_pass_skip_reason = None
     if multi_pass and results:
         try:
             seen_ids = {r["id"] for r in results}
@@ -1169,11 +2563,76 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                 if fts_q2:
                     params2 = [fts_q2] + [p for p in params[1:] if p != limit]
                     params2.append(limit)
-                    rows2 = db.execute(
-                        f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
-                        f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank LIMIT ?", params2
-                    ).fetchall()
-                    pass2 = rows_to_list(rows2)
+
+                    # BCTL-18 fix (Morrow's independent blind test,
+                    # 2026-09-15/16): this second, enrichment-query FTS
+                    # lookup used to run as a bare db.execute, bypassing
+                    # _verify_restore_time_order entirely -- the same
+                    # restore-time staleness the primary query is protected
+                    # against could silently omit or add a pass-2 row,
+                    # reproduced both directions under a real same-path
+                    # file-replacement restore, with the primary path clean.
+                    # Fix: run pass-2 through the identical verified-primary
+                    # state machine, reusing the same _fetch_full_eligible_content
+                    # and _row_matches_filter closures (they mirror the same
+                    # `where`/params used above, unfiltered-corpus reference
+                    # included) -- the only thing that changes per call is
+                    # which FTS query and query-runner get verified.
+                    def _run_pass2_primary():
+                        return rows_to_list(db.execute(
+                            f"SELECT m.* FROM memories_fts fts JOIN memories m ON m.id = fts.rowid "
+                            f"WHERE memories_fts MATCH ? AND {where} ORDER BY rank, m.id LIMIT ?", params2
+                        ).fetchall())
+
+                    try:
+                        _pass2_verify_outcome = _verify_restore_time_order(
+                            db, fts_q2, _fetch_full_eligible_content, _row_matches_filter, limit, _run_pass2_primary
+                        )
+                    except Exception:
+                        # Pass-2 is optional enrichment. Preserve the already-
+                        # verified primary result, but do not make the failed
+                        # enrichment attempt invisible to the caller.
+                        _multi_pass_skipped = True
+                        _multi_pass_skip_reason = "verification_error"
+                        _pass2_verify_outcome = None
+                    # Fail open on anything short of a fully clean pass-2
+                    # verification -- same discipline as the outer try/except
+                    # around this whole block: multi_pass is an enrichment on
+                    # top of an already-verified primary result, so any
+                    # pass-2 verification problem degrades to "no enrichment
+                    # this call," never to discarding or corrupting the
+                    # already-verified primary `results`.
+                    #
+                    # Morrow's independent adversarial recheck (2026-09-16,
+                    # Plane BCTL-18) caught a real gap in the first version
+                    # of this fix: `ok=True` alone is not "verified correct" --
+                    # _verify_restore_time_order also returns `ok=True` with
+                    # `flag="index_verification_failed"` (busy-snapshot
+                    # exhaustion under a caller-owned transaction, or owned-
+                    # retry exhaustion) and `flag="repair_verification_failed"`
+                    # (a repair was attempted but the rerun still disagreed,
+                    # so the honest PRE-repair -- i.e. still-stale -- primary
+                    # is what's returned). Both are real, documented, `ok=True`
+                    # shapes carrying UNCONFIRMED results, by design, for the
+                    # primary query (which must return something rather than
+                    # fail the whole search). Reproduced with a genuine
+                    # two-connection WAL SQLITE_BUSY_SNAPSHOT: the stale
+                    # addition-direction row silently passed through because
+                    # only `ok` was checked. Only `flag is None` means pass-2
+                    # was actually confirmed against a fresh reference.
+                    if (
+                        _pass2_verify_outcome is not None
+                        and _pass2_verify_outcome["ok"]
+                        and _pass2_verify_outcome["flag"] is None
+                    ):
+                        pass2 = _pass2_verify_outcome["results"]
+                    else:
+                        pass2 = []
+                        if _pass2_verify_outcome is not None:
+                            _multi_pass_skipped = True
+                            _multi_pass_skip_reason = (
+                                _pass2_verify_outcome["flag"] or "verification_rejected"
+                            )
                     pass1_ids = {r["id"] for r in results}
 
                     # Continuity gate: a pass-2 hit must contain at least
@@ -1213,10 +2672,32 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
                 lo = (datetime.fromisoformat(created) - _th(hours=temporal_expand_hours)).strftime("%Y-%m-%dT%H:%M:%S")
                 hi = (datetime.fromisoformat(created) + _th(hours=temporal_expand_hours)).strftime("%Y-%m-%dT%H:%M:%S")
                 nb_rows = db.execute(
-                    "SELECT * FROM memories WHERE retired_at IS NULL "
-                    "AND created_at BETWEEN ? AND ? "
-                    "AND id NOT IN ({}) LIMIT 5".format(",".join("?" * len(seen_ids))),
-                    [lo, hi] + list(seen_ids),
+                    # R7-B2 fix (Ari's independent REV7 audit, 2026-09-11): this
+                    # query filtered retirement/time/id but not `indexed = 1`, so
+                    # a construct-only row that never entered FTS (e.g. still
+                    # mid-write, or left ineligible by a prior partial rebuild)
+                    # could be surfaced here even though the primary query above
+                    # enforces indexed=1 eligibility. Temporal expansion must
+                    # honor the same eligibility invariant as ordinary search --
+                    # a row bypassing FTS isn't "found nearby," it's leaked.
+                    #
+                    # R8-B2 fix (Ari's independent REV8 audit, 2026-09-11): the
+                    # indexed=1 fix alone wasn't enough -- the primary query's
+                    # cross-agent borrow/scope/category/memory_type constraints
+                    # (in particular, borrow_from restricting a reader to the
+                    # source agent's scope='global' rows) were never applied to
+                    # this expander either, so a global-only cross-agent borrow
+                    # could pull back another agent's private nearby memory that
+                    # the primary query itself would never have returned. Reuse
+                    # the SAME `where`/`_search_where_params` the primary query
+                    # already built (aliased as `m` to match) rather than
+                    # maintaining a second, independently-drifting filter list --
+                    # this is the actual invariant: an expander must never see
+                    # more than the search it's expanding.
+                    f"SELECT m.* FROM memories m WHERE {where} "
+                    "AND m.created_at BETWEEN ? AND ? "
+                    "AND m.id NOT IN ({}) LIMIT 5".format(",".join("?" * len(seen_ids))),
+                    _search_where_params + [lo, hi] + list(seen_ids),
                 ).fetchall()
                 for nb in rows_to_list(nb_rows):
                     if nb["id"] not in seen_ids:
@@ -1251,11 +2732,53 @@ def tool_memory_search(agent_id: str, query: str, category: str = None,
         except Exception:
             pass
 
-    db.commit(); db.close()
+    db.commit()
+    # Self-touch fix: re-stamp the cold-start fingerprint cache with this
+    # call's own post-write file state -- see _refresh_fts_check_fingerprint's
+    # own docstring for why the db_key must be resolved BEFORE close() (needs
+    # the still-open connection) while the actual file stat must happen
+    # AFTER close() (closing is what actually checkpoints the WAL into the
+    # main file's mtime -- measured directly, not assumed). Best-effort
+    # only: a failure here must never affect the search result already
+    # computed.
+    try:
+        _fts_check_db_key = _resolve_fts_check_db_key(db, DB_PATH)
+    except Exception:
+        _fts_check_db_key = None
+    db.close()
+    if _fts_check_db_key is not None:
+        try:
+            _refresh_fts_check_fingerprint(_fts_check_db_key, DB_PATH)
+        except Exception:
+            pass
     result = {"ok": True, "count": len(results), "memories": results,
               "slot_cap": max_slots, "tier": tier}
     if borrow_from:
         result["borrowed_from"] = borrow_from
+    if _repair_verification_failed:
+        # v5 B1: a repair was attempted, ran as a SQL operation without
+        # raising, but the rerun still disagreed with a fresh reference --
+        # rolled back. `results` here is the honest pre-repair primary
+        # (B3), not the discarded rerun. Distinct from `index_repair_failed`
+        # below (that's an outright SQL failure during repair; this is a
+        # repair that ran clean and simply didn't converge).
+        result["repair_verification_failed"] = True
+    if _index_verification_failed:
+        # R10-B3 fix (Ari's independent REV10 audit, 2026-09-14): the
+        # eligible-content fetch or the real-content FTS check itself
+        # failed to run -- correctness of `results` below could not be
+        # established this call, distinct from a repair having been
+        # attempted and failed. Silently returning `ok: True` here would
+        # let a verifier fault (e.g. a denied in-memory connection)
+        # sitting on top of a genuinely stale index look identical to a
+        # clean, verified answer.
+        result["index_verification_failed"] = True
+    if _multi_pass_skipped:
+        # This flag is deliberately separate from the primary verifier flags
+        # above. The primary result remains verified and usable; only optional
+        # pass-2 enrichment was rejected or failed.
+        result["multi_pass_skipped"] = True
+        result["multi_pass_skip_reason"] = _multi_pass_skip_reason
     return result
 
 
@@ -2032,7 +3555,7 @@ def tool_search(agent_id: str, query: str, limit: int = 20, vector: bool = False
     results = []
 
     if "memories" in intent_tables:
-        _mem_conditions = ["m.retired_at IS NULL"]
+        _mem_conditions = ["m.retired_at IS NULL", "m.indexed = 1"]  # R2-B1 defense in depth
         _mem_params: list = [fts_q]
         if _profile_categories:
             ph = ",".join("?" * len(_profile_categories))
@@ -3287,8 +4810,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             f"tool {name!r} is not in BRAINCTL_ALLOWED_TOOLS — "
             f"either add it to the env var or remove the call"
         )
-    # Inject agent_id from arguments or default
-    agent_id = arguments.pop("agent_id", "mcp-client")
+    # Inject agent_id from arguments, then BRAINCTL_AGENT_ID env var, then default.
+    # Ported from the 2026-08-05 production patch (see
+    # project_reed_brainctl_repair_2026-08-05.md) -- without the env-var fallback,
+    # any agent whose client doesn't pass agent_id explicitly has every memory
+    # silently misattributed to "mcp-client" instead of their own identity.
+    agent_id = arguments.pop("agent_id", os.environ.get("BRAINCTL_AGENT_ID", "mcp-client"))
 
     dispatch = {
         "memory_add": tool_memory_add,
@@ -3662,6 +5189,21 @@ def _ensure_db_initialized() -> None:
             f"brainctl-mcp: applied {applied} migration(s) to {db_path}",
             file=sys.stderr,
         )
+
+    # Heal legacy unscoped memories_fts update triggers (issue #152) on
+    # installs that predate migration 084 or never run migrations.
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        try:
+            if _ensure_fts_triggers_scoped(conn):
+                print(
+                    f"brainctl-mcp: rescoped memories_fts update triggers for {db_path}",
+                    file=sys.stderr,
+                )
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def run():
