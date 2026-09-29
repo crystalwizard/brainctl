@@ -3325,12 +3325,12 @@ def tool_handoff_latest(agent_id: str, status: str | None = None, project: str =
         # Order so pinned wins ties (newest pinned first, then newest pending).
         status_clause = "status IN (?, ?)"
         status_order = (
-            "CASE status WHEN 'pinned' THEN 0 ELSE 1 END, created_at DESC"
+            "CASE status WHEN 'pinned' THEN 0 ELSE 1 END, created_at DESC, id DESC"
         )
         status_params = list(statuses)
     else:
         status_clause = "status = ?"
-        status_order = "created_at DESC"
+        status_order = "created_at DESC, id DESC"
         status_params = [validated["status"]]
 
     db = get_db()

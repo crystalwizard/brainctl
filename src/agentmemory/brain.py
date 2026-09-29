@@ -41,7 +41,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from agentmemory.affect import classify_affect
-from agentmemory._provenance import ORIGINS, PROVENANCE_NOTICE, table_has_column
+from agentmemory._provenance import (
+    ORIGINS, PROVENANCE_NOTICE, PROVENANCE_NOTICE_SHORT, table_has_column,
+)
 from agentmemory.paths import get_db_path
 
 try:
@@ -696,8 +698,18 @@ class Brain:
     # ------------------------------------------------------------------
 
     def handoff(self, goal: str, current_state: str, open_loops: str, next_step: str,
-                project: Optional[str] = None, title: Optional[str] = None,
-                origin: str = "api", source_event_id: Optional[int] = None) -> int:
+                project: Optional[str] = None, title: Optional[str] = None) -> int:
+        """Create a handoff packet for session continuity. Returns packet ID.
+
+        Stamped origin='api'. The caller cannot choose the origin: only
+        ``wrap_up()`` writes origin='wrap_up' (via ``_write_handoff``).
+        """
+        return self._write_handoff(goal, current_state, open_loops, next_step,
+                                   project=project, title=title, origin="api")
+
+    def _write_handoff(self, goal: str, current_state: str, open_loops: str, next_step: str,
+                       project: Optional[str] = None, title: Optional[str] = None,
+                       origin: str = "api", source_event_id: Optional[int] = None) -> int:
         """Create a handoff packet for session continuity. Returns packet ID.
 
         Use before ending a session to preserve working context for the next agent.
@@ -739,11 +751,12 @@ class Brain:
             if project:
                 q += " AND project = ?"
                 params.append(project)
-            q += " ORDER BY created_at DESC LIMIT 1"
+            q += " ORDER BY created_at DESC, id DESC LIMIT 1"
             row = db.execute(q, params).fetchone()
             if not row:
                 return {}
             packet = dict(row)
+            packet["provenance_notice"] = PROVENANCE_NOTICE
             now = _now_ts()
             db.execute(
                 "UPDATE handoff_packets SET status = 'consumed', consumed_at = ?, updated_at = ? WHERE id = ?",
@@ -951,7 +964,7 @@ class Brain:
             project=project,
             importance=0.7,
         )
-        handoff_id = self.handoff(
+        handoff_id = self._write_handoff(
             goal=goal or summary,
             current_state=summary,
             open_loops=open_loops or "none noted",
@@ -1026,6 +1039,7 @@ class Brain:
                 if matched:
                     m = dict(row)
                     m["matched_keywords"] = matched
+                    m["provenance_notice"] = PROVENANCE_NOTICE_SHORT
                     matches.append(m)
             matches.sort(key=lambda m: _PRIORITY_ORDER.get(m.get("priority", "medium"), 2))
             return matches

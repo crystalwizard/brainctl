@@ -10,6 +10,7 @@ Database: $BRAIN_DB or $BRAINCTL_HOME/db/brain.db (default: ~/agentmemory/db/bra
 
 import argparse
 from agentmemory._provenance import table_has_column as _table_has_column
+from agentmemory._provenance import PROVENANCE_NOTICE as _PROVENANCE_NOTICE
 import hashlib as _hashlib
 import json
 import logging
@@ -2560,7 +2561,8 @@ def cmd_trigger_check(args):
     query_text = args.query
     matches = _check_triggers(db, query_text)
     db.commit()
-    json_out({"ok": True, "query": query_text, "matched_triggers": matches, "count": len(matches)})
+    json_out({"ok": True, "query": query_text, "matched_triggers": matches, "count": len(matches),
+              "provenance_notice": _PROVENANCE_NOTICE})
 
 
 def cmd_trigger_fire(args):
@@ -5111,27 +5113,27 @@ def cmd_handoff_latest(args):
 
     if validated["chat_id"] and validated["thread_id"]:
         candidates.append((
-            "SELECT * FROM handoff_packets WHERE chat_id = ? AND thread_id = ? AND status = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM handoff_packets WHERE chat_id = ? AND thread_id = ? AND status = ? AND agent_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
             (validated["chat_id"], validated["thread_id"], status, validated["agent_id"]),
         ))
     if validated["chat_id"]:
         candidates.append((
-            "SELECT * FROM handoff_packets WHERE chat_id = ? AND status = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM handoff_packets WHERE chat_id = ? AND status = ? AND agent_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
             (validated["chat_id"], status, validated["agent_id"]),
         ))
     if validated["project"]:
         candidates.append((
-            "SELECT * FROM handoff_packets WHERE project = ? AND status = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM handoff_packets WHERE project = ? AND status = ? AND agent_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
             (validated["project"], status, validated["agent_id"]),
         ))
     if validated["user_id"]:
         candidates.append((
-            "SELECT * FROM handoff_packets WHERE user_id = ? AND agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM handoff_packets WHERE user_id = ? AND agent_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT 1",
             (validated["user_id"], validated["agent_id"], status),
         ))
 
     candidates.append((
-        "SELECT * FROM handoff_packets WHERE agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT * FROM handoff_packets WHERE agent_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT 1",
         (validated["agent_id"], status),
     ))
 
@@ -5141,7 +5143,10 @@ def cmd_handoff_latest(args):
         if row:
             break
 
-    json_out(row_to_dict(row) or {})
+    packet = row_to_dict(row) or {}
+    if packet:
+        packet["provenance_notice"] = _PROVENANCE_NOTICE
+    json_out(packet)
 
 
 def cmd_handoff_consume(args):
@@ -7651,6 +7656,7 @@ def cmd_search(args, *, db=None, db_path: Optional[str] = None):
     }
     if _triggered:
         _out["triggered_memories"] = _triggered
+        _out["provenance_notice"] = _PROVENANCE_NOTICE
     # 2.3.1: surface reranker signal-informativeness gate decisions so an
     # auditor can see WHY a particular ranking happened (e.g. uniform
     # timestamps tripped the recency gate). Kept outside `results` so it
