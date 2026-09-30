@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from agentmemory.affect import classify_affect
 from agentmemory._provenance import (
     ORIGINS, PROVENANCE_NOTICE, PROVENANCE_NOTICE_SHORT, WRAP_UP_AUTHORITY,
-    table_has_column,
+    handoff_origin_flag, table_has_column,
 )
 from agentmemory.paths import get_db_path
 
@@ -802,6 +802,28 @@ class Brain:
                 result["handoff"] = dict(hrow) if hrow else None
             except sqlite3.OperationalError:
                 result["handoff"] = None
+
+            # 1b. Flag a newest pending handoff that did not come from
+            # wrap_up (Cairn persistence-gap item 2). Keyed on origin only:
+            # source_event_id is caller-suppliable on the direct/cli paths.
+            # Absent key means the normal case. A failure here never blocks
+            # orient.
+            try:
+                h = result.get("handoff")
+                if h and h.get("origin") not in (None, "wrap_up"):
+                    lq = ("SELECT id, created_at FROM handoff_packets "
+                          "WHERE agent_id = ? AND origin = 'wrap_up'")
+                    lp: list[str] = [self.agent_id]
+                    if project:
+                        lq += " AND project = ?"
+                        lp.append(project)
+                    lq += " ORDER BY created_at DESC, id DESC LIMIT 1"
+                    lrow = db.execute(lq, lp).fetchone()
+                    flag = handoff_origin_flag(h["origin"], dict(lrow) if lrow else None)
+                    if flag:
+                        result["handoff_flag"] = flag
+            except sqlite3.OperationalError:
+                pass
 
             # 2. Recent events (last 10)
             try:

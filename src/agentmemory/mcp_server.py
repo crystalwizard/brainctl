@@ -4270,7 +4270,10 @@ TOOLS = [
             "handoff from the last session, recent events, active triggers, top "
             "memories, and stats. Use at the beginning of every session so the "
             "agent can resume exactly where the previous run left off. This is "
-            "the flagship drop-in pattern: `ctx = orient() -> do work -> wrap_up()`."
+            "the flagship drop-in pattern: `ctx = orient() -> do work -> wrap_up()`. "
+            "If the newest pending handoff was not written by wrap_up, the result "
+            "carries a `handoff_flag` (level, origin, message, last_wrap_up); the "
+            "key is absent in the normal case."
         ),
         inputSchema={
             "type": "object",
