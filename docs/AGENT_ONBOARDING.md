@@ -203,7 +203,7 @@ brainctl resolves the database location at process start. The relevant env vars:
 |---|---|
 | `BRAINCTL_HOME` | Root for `db/brain.db`, `backups/`, etc. Defaults to `~/agentmemory`. |
 | `BRAIN_DB` | Direct path to a `brain.db` file. Overrides `BRAINCTL_HOME`. |
-| `BRAIN_DB_FEDERATION` | Federated multi-DB routing config (multi-profile setups). |
+| `BRAIN_DB_FEDERATION` | Federated multi-DB routing config (multi-profile setups). Paths separated by `:` (POSIX) or `;` (Windows; `:` also accepted, drive-letter colons preserved). |
 
 ### Service-launched processes (systemd, launchd, gateway daemons)
 

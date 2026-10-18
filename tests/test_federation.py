@@ -1,6 +1,7 @@
 """Tests for agentmemory.federation — multi-DB federation engine."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -91,7 +92,7 @@ class TestGetFederationPaths:
         for db, aid in [(db1, "a"), (db2, "b"), (db3, "c")]:
             Brain(db_path=str(db), agent_id=aid)
         monkeypatch.setenv("BRAIN_DB", str(db1))
-        monkeypatch.setenv("BRAIN_DB_FEDERATION", f"{db2}:{db3}")
+        monkeypatch.setenv("BRAIN_DB_FEDERATION", os.pathsep.join([str(db2), str(db3)]))
         paths = fed.get_federation_paths()
         assert len(paths) == 3
 

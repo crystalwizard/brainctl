@@ -64,11 +64,26 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _split_federation_env(value: str) -> list[str]:
+    """Split a BRAIN_DB_FEDERATION value into individual paths.
+
+    POSIX: split on ":". Windows: split on os.pathsep (";"), and also accept
+    ":" separators but not the colon in a drive prefix like "E:\\x.db" (a
+    single letter at the start of a segment followed by ":").
+    """
+    if os.pathsep == ":":
+        return value.split(":")
+    parts: list[str] = []
+    for chunk in value.split(os.pathsep):
+        parts.extend(re.split(r"(?<!(?<![^:;])[A-Za-z]):", chunk))
+    return parts
+
+
 def get_federation_paths() -> list[str]:
     """Return deduplicated list of DB paths to federate.
 
-    BRAIN_DB is always first. BRAIN_DB_FEDERATION (colon-separated) is
-    appended. Paths are resolved to absolute form before dedup so that
+    BRAIN_DB is always first. BRAIN_DB_FEDERATION (os.pathsep-separated: ":"
+    on POSIX, ";" on Windows, where ":" is also accepted) is appended. Paths are resolved to absolute form before dedup so that
     equivalent paths in different representations collapse.
     """
     seen: dict[str, None] = {}  # ordered set via dict
@@ -78,7 +93,7 @@ def get_federation_paths() -> list[str]:
     seen[abs_primary] = None
 
     federation_env = os.environ.get("BRAIN_DB_FEDERATION", "")
-    for raw in federation_env.split(":"):
+    for raw in _split_federation_env(federation_env):
         raw = raw.strip()
         if not raw:
             continue
